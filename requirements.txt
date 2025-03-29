@@ -1,0 +1,7 @@
+argparse
+httpx
+tweepy
+praw
+rich
+Pillow
+atproto
