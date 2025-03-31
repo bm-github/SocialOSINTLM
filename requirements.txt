@@ -1,7 +1,7 @@
-argparse
 httpx
 tweepy
 praw
+python-dotenv
 rich
-Pillow
 atproto
+Pillow

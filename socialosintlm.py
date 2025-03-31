@@ -203,7 +203,7 @@ class SocialOSINTLM:
             return cached
 
         try:
-            url = f"https://hn.algolia.com/api/v1/search?tags=author_{quote_plus(username)}&hitsPerPage=50"
+            url = f"https://hn.algolia.com/api/v1/search?tags=author_{quote_plus(username)}&hitsPerPage=30"
             
             with httpx.Client() as client:
                 response = client.get(url, timeout=15)
@@ -437,7 +437,7 @@ class SocialOSINTLM:
                     response = self.bluesky.get_author_feed(
                         actor=username,
                         cursor=cursor,
-                        limit=100
+                        limit=50
                     )
                 except exceptions.AtProtocolError as e:
                     if 'rate limit' in str(e).lower():
@@ -693,7 +693,7 @@ class SocialOSINTLM:
             media_paths = []
 
             # Fetch submissions
-            for submission in user.submissions.new(limit=20):
+            for submission in user.submissions.new(limit=15):
                 submission_data = {
                     'id': submission.id,
                     'title': submission.title,
@@ -757,7 +757,7 @@ class SocialOSINTLM:
                 submissions.append(submission_data)
             
             # Fetch comments
-            for comment in user.comments.new(limit=30):
+            for comment in user.comments.new(limit=15):
                 comments.append({
                     'id': comment.id,
                     'text': comment.body[:500],
@@ -798,7 +798,7 @@ class SocialOSINTLM:
     def _format_text_data(self, platform: str, username: str, data: dict) -> str:
         """Formats fetched data into a more detailed text block for the analysis LLM."""
         # Define how many items to include per platform (adjust as needed for token limits)
-        MAX_ITEMS = 15
+        MAX_ITEMS = 30
         TEXT_SNIPPET_LENGTH = 500 # Max characters for long text fields
 
         output_lines = []
