@@ -15,47 +15,100 @@
 
 ```mermaid
 flowchart TD
-    A[Start Analysis] --> B{Platform Selection}
-    B -->|Twitter| C1[Fetch Twitter Data]
-    B -->|Reddit| C2[Fetch Reddit Data]
-    B -->|HackerNews| C3[Fetch HackerNews Data]
-    B -->|Bluesky| C4[Fetch Bluesky Data]
-    
-    C1 --> D1[Extract User Posts]
-    C4 --> D1
-    C3 --> D1
-    C2 --> D1
-    
-    C1 --> D2[Extract Media URLs]
-    C4 --> D2
-    
-    D2 --> E1[Download Media]
-    E1 --> F[Analyse Images via OpenRouter]
-    F --> G[Store Image Analysis]
-    
-    D1 --> H[Collect Text Data]
-    
-    subgraph "Media Analysis Path"
-        D2
-        E1
-        F
-        G
+    %% Main nodes with styling
+    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients}}
+    AA --> B{Interactive or\nStdin Mode?}
+
+    %% Interactive path with rounded rectangles and colors
+    B -->|Interactive| C[/Display Platform Menu/]:::menuClass
+    C --> D{Platform\nSelection}:::decisionClass
+    D -->|Twitter| E1([Twitter]):::twitterClass
+    D -->|Reddit| E2([Reddit]):::redditClass
+    D -->|HackerNews| E3([HackerNews]):::hnClass
+    D -->|Bluesky| E4([Bluesky]):::bskyClass
+    D -->|Cross-Platform| E5([Multiple Platforms]):::multiClass
+
+    %% Stdin path
+    B -->|Stdin| F([Parse JSON Input]):::inputClass
+    F --> G([Extract Platforms & Query]):::inputClass
+
+    %% Analysis loop entry points
+    E1 & E2 & E3 & E4 & E5 --> H([Enter Analysis Loop]):::loopClass
+    G --> J([Run Analysis]):::analysisClass
+
+    %% Command processing in analysis loop
+    H -->|Query Input| I{Command\nType}:::decisionClass
+    I -->|Analysis Query| J
+    I -->|exit| Z([End Session]):::endClass
+    I -->|refresh| Y([Force Refresh Cache]):::refreshClass
+    Y --> H
+
+    %% Data fetching with cache check
+    J --> K{Cache\nAvailable?}:::cacheClass
+    K -->|Yes| M([Load Cached Data]):::cacheClass
+    K -->|No| L([Fetch Platform Data]):::apiClass
+
+    %% Rate limiting subgraph
+    subgraph API_Handling [API & Rate Limit Handling]
+        direction TB
+        L --> L1{Rate\nLimited?}:::errorClass
+        L1 -->|Yes| L2([Handle Rate Limit]):::errorClass
+        L2 --> L5([Abort or Retry]):::errorClass
+        L1 -->|No| L3([Extract Text & URLs]):::dataClass
+        L3 --> L4([Save to Cache]):::cacheClass
     end
-    
-    subgraph "Text-Only Path"
-        D1
-        H
+
+    L4 --> M
+
+    %% Parallel processing paths
+    M --> N([Process Text Data]):::textClass
+    M --> O([Process Media Data]):::mediaClass
+
+    %% Media analysis subgraph
+    subgraph Media_Analysis [Media Analysis Pipeline]
+        direction TB
+        O --> P([Download Media Files]):::mediaClass
+        P --> Q([Image Analysis via LLM]):::llmClass
     end
-    
-    G --> I[Combine All Data]
-    H --> I
-    
-    I --> J[Create Analysis Prompt]
-    J --> K[Send to OpenRouter LLM]
-    K --> L[Format and Return Analysis]
-    
-    L --> M[Save Output as markdown]
-    L --> N[Display Results]
+
+    %% Text formatting and combining results
+    N --> S([Format Platform Text]):::textClass
+    Q --> R([Collect Media Analysis]):::mediaClass
+
+    R & S --> T([Combine All Data]):::dataClass
+
+    %% Final analysis and output
+    T --> U([Call Analysis LLM with Query]):::llmClass
+    U --> V([Format Analysis Results]):::outputClass
+
+    V --> W([Display/Save Results]):::outputClass
+    W --> H
+
+    %% Custom styling with improved contrast
+    classDef defaultClass fill:#FFFFFF,stroke:#333,stroke-width:1px,color:#000
+    classDef menuClass fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px,color:#000
+    classDef decisionClass fill:#FFF9C4,stroke:#FBC02D,stroke-width:2px,color:#000
+    classDef twitterClass fill:#1DA1F2,stroke:#0D47A1,stroke-width:2px,color:#FFF
+    classDef redditClass fill:#FF5700,stroke:#8D2202,stroke-width:2px,color:#FFF
+    classDef hnClass fill:#FF6600,stroke:#7F3300,stroke-width:2px,color:#FFF
+    classDef bskyClass fill:#66BB6A,stroke:#1B5E20,stroke-width:2px,color:#FFF
+    classDef multiClass fill:#4DB6AC,stroke:#004D40,stroke-width:2px,color:#FFF
+    classDef inputClass fill:#E3F2FD,stroke:#1976D2,stroke-width:2px,color:#000
+    classDef loopClass fill:#CE93D8,stroke:#6A1B9A,stroke-width:2px,color:#000
+    classDef analysisClass fill:#BBDEFB,stroke:#1565C0,stroke-width:2px,color:#000
+    classDef endClass fill:#FFCDD2,stroke:#C62828,stroke-width:2px,color:#000
+    classDef refreshClass fill:#80CBC4,stroke:#004D40,stroke-width:2px,color:#000
+    classDef cacheClass fill:#B2EBF2,stroke:#006064,stroke-width:2px,color:#000
+    classDef apiClass fill:#C5E1A5,stroke:#33691E,stroke-width:2px,color:#000
+    classDef errorClass fill:#E57373,stroke:#B71C1C,stroke-width:2px,color:#000
+    classDef dataClass fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#000
+    classDef textClass fill:#90CAF9,stroke:#1565C0,stroke-width:2px,color:#000
+    classDef mediaClass fill:#F48FB1,stroke:#AD1457,stroke-width:2px,color:#000
+    classDef llmClass fill:#FFCC80,stroke:#EF6C00,stroke-width:2px,color:#000
+    classDef outputClass fill:#F0F4C3,stroke:#827717,stroke-width:2px,color:#000
+
+    %% Style all nodes with default class if not otherwise specified
+    class A,AA,B defaultClass
 ```
 
 ## 🛠 Installation
