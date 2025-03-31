@@ -2,6 +2,37 @@
 
 **SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
+
+## 🌟 Key Features
+
+✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), and Bluesky
+
+✅ **AI-Powered Analysis:** Utilizes configurable models via the OpenRouter API for sophisticated text and image analysis
+
+✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style
+
+✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
+
+✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1024x1024) for analysis
+
+✅ **Cross-Account Comparison:** Analyze profiles across multiple selected platforms simultaneously
+
+✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`
+
+
+✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`
+
+✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
+
+✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`)
+
+✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 30 tweets, 20 Reddit submissions, 30 Reddit comments, 50 HN items, ~300 Bluesky posts) to balance depth and API usage
+
+✅ **Detailed Logging:** Logs errors and operational details to `analyser.log`
+
+✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file
+
+
 ```mermaid
 flowchart TD
     %% Main nodes with styling
@@ -99,23 +130,6 @@ flowchart TD
     %% Style all nodes with default class if not otherwise specified
     class A,AA,B defaultClass
 ```
-
-## 🌟 Key Features
-
-✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), and Bluesky.
-✅ **AI-Powered Analysis:** Utilizes configurable models via the OpenRouter API for sophisticated text and image analysis.
-✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style.
-✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity).
-✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1024x1024) for analysis.
-✅ **Cross-Account Comparison:** Analyze profiles across multiple selected platforms simultaneously.
-✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`.
-✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`.
-✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results.
-✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`).
-✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 30 tweets, 20 Reddit submissions, 30 Reddit comments, 50 HN items, ~300 Bluesky posts) to balance depth and API usage.
-✅ **Detailed Logging:** Logs errors and operational details to `analyser.log`.
-✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file.
-
 ## 🛠 Installation
 
 ### Prerequisites
