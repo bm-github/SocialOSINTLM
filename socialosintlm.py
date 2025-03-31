@@ -573,7 +573,6 @@ class SocialOSINTLM:
     def analyse(self, platforms: Dict[str, Union[str, List[str]]], query: str) -> str:
         collected_data = []
         media_analysis = []
-        twitter_accounts = {}
 
         try:
             collect_task = self.progress.add_task(
@@ -596,11 +595,7 @@ class SocialOSINTLM:
                         if data:
                             collected_data.append(self._format_text_data(platform, username, data))
                             
-                            if platform == 'twitter':
-                                media_analysis.extend(data.get('media_analysis', []))
-                                twitter_accounts[username] = data
-                            
-                            if platform == 'bluesky':
+                            if platform in ['twitter', 'bluesky', 'reddit']:
                                 media_analysis.extend(data.get('media_analysis', []))
                             
                             self.progress.advance(collect_task)
@@ -685,23 +680,247 @@ class SocialOSINTLM:
         except Exception as e:
             return f"Analysis failed: {str(e)}"
 
+    def fetch_reddit(self, username: str, force=False) -> Optional[dict]:
+        """Fetches user submissions and comments from Reddit with image handling"""
+        if not force and (cached := self._load_cache('reddit', username)):
+            return cached
+
+        try:
+            user = self.reddit.redditor(username)
+            submissions = []
+            comments = []
+            media_analysis = []
+            media_paths = []
+
+            # Fetch submissions
+            for submission in user.submissions.new(limit=20):
+                submission_data = {
+                    'id': submission.id,
+                    'title': submission.title,
+                    'text': submission.selftext[:500] if hasattr(submission, 'selftext') else '',
+                    'score': submission.score,
+                    'subreddit': submission.subreddit.display_name,
+                    'permalink': submission.permalink,
+                    'created_utc': datetime.fromtimestamp(submission.created_utc, tz=timezone.utc),
+                    'media': []
+                }
+                
+                # Check for images in submission
+                if hasattr(submission, 'url') and submission.url:
+                    url = submission.url.lower()
+                    # Check if URL is a direct image
+                    if any(url.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                        media_path = self._download_media(
+                            url=submission.url, 
+                            platform='reddit', 
+                            username=username
+                        )
+                        if media_path:
+                            media_paths.append(str(media_path))
+                            if analysis := self._analyse_image(
+                                media_path, 
+                                f"Reddit user u/{username}'s post in r/{submission.subreddit.display_name}"
+                            ):
+                                submission_data['media'].append({
+                                    'type': 'image',
+                                    'analysis': analysis,
+                                    'url': submission.url,
+                                    'local_path': str(media_path)
+                                })
+                                media_analysis.append(analysis)
+                    # Handle Reddit gallery posts
+                    elif hasattr(submission, 'is_gallery') and submission.is_gallery:
+                        if hasattr(submission, 'media_metadata'):
+                            for image_id, image_data in submission.media_metadata.items():
+                                if image_data['e'] == 'Image':  # e = 'Image' means it's an image
+                                    if 's' in image_data and 'u' in image_data['s']:  # s = source, u = url
+                                        image_url = image_data['s']['u']
+                                        media_path = self._download_media(
+                                            url=image_url, 
+                                            platform='reddit', 
+                                            username=username
+                                        )
+                                        if media_path:
+                                            media_paths.append(str(media_path))
+                                            if analysis := self._analyse_image(
+                                                media_path, 
+                                                f"Reddit user u/{username}'s gallery post in r/{submission.subreddit.display_name}"
+                                            ):
+                                                submission_data['media'].append({
+                                                    'type': 'gallery_image',
+                                                    'analysis': analysis,
+                                                    'url': image_url,
+                                                    'local_path': str(media_path)
+                                                })
+                                                media_analysis.append(analysis)
+                
+                submissions.append(submission_data)
+            
+            # Fetch comments
+            for comment in user.comments.new(limit=30):
+                comments.append({
+                    'id': comment.id,
+                    'text': comment.body[:500],
+                    'score': comment.score,
+                    'subreddit': comment.subreddit.display_name,
+                    'permalink': comment.permalink,
+                    'created_utc': datetime.fromtimestamp(comment.created_utc, tz=timezone.utc)
+                })
+            
+            # Compile the data
+            data = {
+                'submissions': submissions,
+                'comments': comments,
+                'media_analysis': media_analysis,
+                'media_paths': media_paths,
+                'stats': {
+                    'total_submissions': len(submissions),
+                    'total_comments': len(comments),
+                    'submissions_with_media': len([s for s in submissions if s['media']]),
+                    'total_media': len(media_paths),
+                    'avg_submission_score': sum(s['score'] for s in submissions)/max(len(submissions), 1),
+                    'avg_comment_score': sum(c['score'] for c in comments)/max(len(comments), 1)
+                }
+            }
+            
+            self._save_cache('reddit', username, data)
+            return data
+            
+        except prawcore.exceptions.RequestException as e:
+            if '429' in str(e):  # Rate limit error
+                self._handle_rate_limit('Reddit', exception=e)
+            logger.error(f"Reddit fetch failed: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Reddit fetch failed: {str(e)}")
+            return None
+
     def _format_text_data(self, platform: str, username: str, data: dict) -> str:
+        """Formats fetched data into a more detailed text block for the analysis LLM."""
+        # Define how many items to include per platform (adjust as needed for token limits)
+        MAX_ITEMS = 15
+        TEXT_SNIPPET_LENGTH = 500 # Max characters for long text fields
+
+        output_lines = []
+
         if platform == 'twitter':
-            return f"Twitter data for @{username}:\n" + "\n".join(
-                f"- Tweet: {t['text']}\n  Likes: {t['metrics']['like_count']}"
-                for t in data.get('tweets', [])[:5]
+            output_lines.append(f"### Twitter Data Summary for @{username}")
+            user_info = data.get('user_info', {})
+            if user_info:
+                output_lines.append(f"- User: {user_info.get('name')} (@{user_info.get('username')}), ID: {user_info.get('id')}")
+                if user_info.get('created_at'):
+                     output_lines.append(f"- Account Created: {user_info['created_at']}")
+
+            tweets = data.get('tweets', [])
+            output_lines.append(f"\n**Recent Tweets (up to {MAX_ITEMS}):**")
+            if not tweets:
+                output_lines.append("- No tweets found in fetched data.")
+            for i, t in enumerate(tweets[:MAX_ITEMS]):
+                media_info = f" (Media Attached: {len(t.get('media', []))})" if t.get('media') else ""
+                output_lines.append(
+                    f"- Tweet {i+1} ({t.get('created_at', 'N/A')}):\n"
+                    f"  Text: {t.get('text', '[No Text]')[:TEXT_SNIPPET_LENGTH]}{'...' if len(t.get('text', '')) > TEXT_SNIPPET_LENGTH else ''}\n"
+                    f"  Metrics: Likes={t.get('metrics', {}).get('like_count', 0)}, "
+                    f"Retweets={t.get('metrics', {}).get('retweet_count', 0)}, "
+                    f"Replies={t.get('metrics', {}).get('reply_count', 0)}{media_info}"
+                )
+            # Add overall media analysis summary if needed, although it's also sent separately
+            # output_lines.append(f"\n- Total image analyses from this user: {len(data.get('media_analysis', []))}")
+
+        elif platform == 'reddit':
+            output_lines.append(f"### Reddit Data Summary for u/{username}")
+            stats = data.get('stats', {})
+            output_lines.append(
+                f"- Stats Overview: Submissions={stats.get('total_submissions', 0)}, "
+                f"Comments={stats.get('total_comments', 0)}, "
+                f"Media Posts={stats.get('submissions_with_media', 0)}, "
+                f"Avg Sub Score={stats.get('avg_submission_score', 0):.1f}, "
+                f"Avg Comment Score={stats.get('avg_comment_score', 0):.1f}"
             )
+
+            submissions = data.get('submissions', [])
+            output_lines.append(f"\n**Recent Submissions (up to {MAX_ITEMS}):**")
+            if not submissions:
+                 output_lines.append("- No submissions found.")
+            for i, s in enumerate(submissions[:MAX_ITEMS]):
+                media_info = f" (Media Attached: {len(s.get('media', []))})" if s.get('media') else ""
+                text_preview = (s.get('text') or "")[:TEXT_SNIPPET_LENGTH]
+                text_info = f"\n  Text Preview: {text_preview}{'...' if len(s.get('text', '')) > TEXT_SNIPPET_LENGTH else ''}" if text_preview else ""
+                output_lines.append(
+                    f"- Submission {i+1} in r/{s.get('subreddit', 'N/A')} ({s.get('created_utc', 'N/A')}):\n"
+                    f"  Title: {s.get('title', '[No Title]')}\n"
+                    f"  Score: {s.get('score', 0)}{media_info}"
+                    f"{text_info}"
+                )
+
+            comments = data.get('comments', [])
+            output_lines.append(f"\n**Recent Comments (up to {MAX_ITEMS}):**")
+            if not comments:
+                 output_lines.append("- No comments found.")
+            for i, c in enumerate(comments[:MAX_ITEMS]):
+                output_lines.append(
+                    f"- Comment {i+1} in r/{c.get('subreddit', 'N/A')} ({c.get('created_utc', 'N/A')}):\n"
+                    f"  Text: {c.get('text', '[No Text]')[:TEXT_SNIPPET_LENGTH]}{'...' if len(c.get('text', '')) > TEXT_SNIPPET_LENGTH else ''}\n"
+                    f"  Score: {c.get('score', 0)}"
+                )
+            # output_lines.append(f"\n- Total image analyses from this user: {len(data.get('media_analysis', []))}")
+
+        elif platform == 'hackernews':
+            output_lines.append(f"### Hacker News Data Summary for {username}")
+            stats = data.get('stats', {})
+            output_lines.append(
+                f"- Stats Overview: Submissions={stats.get('total_submissions', 0)}, "
+                f"Avg Points={stats.get('average_points', 0):.1f}"
+            )
+            submissions = data.get('submissions', [])
+            output_lines.append(f"\n**Recent Submissions (up to {MAX_ITEMS}):**")
+            if not submissions:
+                output_lines.append("- No submissions found.")
+            for i, s in enumerate(submissions[:MAX_ITEMS]):
+                 text_preview = (s.get('text') or "")[:TEXT_SNIPPET_LENGTH]
+                 text_info = f"\n  Text Preview: {text_preview}{'...' if len(s.get('text', '')) > TEXT_SNIPPET_LENGTH else ''}" if text_preview else ""
+                 url_info = f"\n  URL: {s.get('url', 'N/A')}" if s.get('url') else ""
+                 output_lines.append(
+                     f"- Submission {i+1} ({s.get('created_at', 'N/A')}):\n"
+                     f"  Title: {s.get('title', '[No Title]')}\n"
+                     f"  Points: {s.get('points', 0)}, Comments: {s.get('num_comments', 0)}"
+                     f"{url_info}{text_info}"
+                 )
+
+        elif platform == 'bluesky':
+            output_lines.append(f"### Bluesky Data Summary for {username}") # Assuming username includes handle
+            stats = data.get('stats', {})
+            output_lines.append(
+                 f"- Stats Overview: Posts={stats.get('total_posts', 0)}, "
+                 f"Media Posts={stats.get('posts_with_media', 0)}, "
+                 f"Avg Likes={stats.get('avg_likes', 0):.1f}, "
+                 f"Avg Reposts={stats.get('avg_reposts', 0):.1f}"
+            )
+            posts = data.get('posts', [])
+            output_lines.append(f"\n**Recent Posts (up to {MAX_ITEMS}):**")
+            if not posts:
+                 output_lines.append("- No posts found.")
+            for i, p in enumerate(posts[:MAX_ITEMS]):
+                 media_info = f" (Media Attached: {len(p.get('media', []))})" if p.get('media') else ""
+                 # Ensure created_at is formatted correctly if it's already a string
+                 created_at_str = p.get('created_at', 'N/A')
+                 if isinstance(created_at_str, datetime):
+                     created_at_str = created_at_str.isoformat()
+
+                 output_lines.append(
+                     f"- Post {i+1} ({created_at_str}):\n"
+                     f"  Text: {p.get('text', '[No Text]')[:TEXT_SNIPPET_LENGTH]}{'...' if len(p.get('text', '')) > TEXT_SNIPPET_LENGTH else ''}\n"
+                     f"  Likes: {p.get('likes', 0)}, Reposts: {p.get('reposts', 0)}{media_info}"
+                 )
+            # output_lines.append(f"\n- Total image analyses from this user: {len(data.get('media_analysis', []))}")
+
+        else:
+            # Fallback for any other platform if added later
+            output_lines.append(f"### {platform.capitalize()} Data Summary for {username}")
+            output_lines.append(f"- Raw Data Preview: {str(data)[:500]}...") # Very basic preview
+
+        return "\n".join(output_lines)
         
-        if platform == 'reddit':
-            submissions = "\n".join(
-                f"- Post in r/{p['subreddit']}: {p['title']}\n  Score: {p['score']}"
-                for p in data.get('submissions', [])[:3]
-            )
-            comments = "\n".join(
-                f"- Comment in r/{c['subreddit']}: {c['text']}\n  Score: {c['score']}"
-                for c in data.get('comments', [])[:3]
-            )
-            return f"Reddit data for u/{username}:\nSubmissions:\n{submissions}\nComments:\n{comments}"
         
         if platform == 'hackernews':
             return f"Hacker News data for {username}:\n" + "\n".join(
