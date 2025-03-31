@@ -13,6 +13,51 @@
 ✅ Interactive CLI with rich formatting  
 ✅ Supports both interactive and programmatic usage  
 
+```mermaid
+flowchart TD
+    A[Start Analysis] --> B{Platform Selection}
+    B -->|Twitter| C1[Fetch Twitter Data]
+    B -->|Reddit| C2[Fetch Reddit Data]
+    B -->|HackerNews| C3[Fetch HackerNews Data]
+    B -->|Bluesky| C4[Fetch Bluesky Data]
+    
+    C1 --> D1[Extract User Posts]
+    C4 --> D1
+    C3 --> D1
+    C2 --> D1
+    
+    C1 --> D2[Extract Media URLs]
+    C4 --> D2
+    
+    D2 --> E1[Download Media]
+    E1 --> F[Analyse Images via OpenRouter]
+    F --> G[Store Image Analysis]
+    
+    D1 --> H[Collect Text Data]
+    
+    subgraph "Media Analysis Path"
+        D2
+        E1
+        F
+        G
+    end
+    
+    subgraph "Text-Only Path"
+        D1
+        H
+    end
+    
+    G --> I[Combine All Data]
+    H --> I
+    
+    I --> J[Create Analysis Prompt]
+    J --> K[Send to OpenRouter LLM]
+    K --> L[Format and Return Analysis]
+    
+    L --> M[Save Output as markdown]
+    L --> N[Display Results]
+```
+
 ## 🛠 Installation
 ### Prerequisites
 Ensure you have **Python 3.8+** installed. Then, install the dependencies:
