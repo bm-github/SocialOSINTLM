@@ -12,6 +12,7 @@ from functools import lru_cache
 import httpx
 import tweepy
 import praw
+import prawcore
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TaskID
 from rich.panel import Panel

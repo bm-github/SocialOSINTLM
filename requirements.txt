@@ -1,6 +1,7 @@
 httpx
 tweepy
 praw
+prawcore
 python-dotenv
 rich
 atproto
