@@ -1,21 +1,21 @@
 # 🚀 SocialOSINTLM
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyses user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 
 ## 🌟 Key Features
 
 ✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), and Bluesky
 
-✅ **AI-Powered Analysis:** Utilizes configurable models via the OpenRouter API for sophisticated text and image analysis
+✅ **AI-Powered Analysis:** Utilises configurable models via the OpenRouter API for sophisticated text and image analysis
 
 ✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style
 
-✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
+✅ **Vision-Capable Image Analysis:** Analyses downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
 
 ✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1024x1024) for analysis
 
-✅ **Cross-Account Comparison:** Analyze profiles across multiple selected platforms simultaneously
+✅ **Cross-Account Comparison:** Analyse profiles across multiple selected platforms simultaneously
 
 ✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`
 
@@ -157,7 +157,7 @@ flowchart TD
     # Reddit (Create an app at https://www.reddit.com/prefs/apps)
     export REDDIT_CLIENT_ID='your_reddit_client_id'
     export REDDIT_CLIENT_SECRET='your_reddit_client_secret'
-    export REDDIT_USER_AGENT='YourAppName/1.0 by YourUsername' # Customize this
+    export REDDIT_USER_AGENT='YourAppName/1.0 by YourUsername' # Customise this
 
     # Bluesky (Generate an App Password in Bluesky settings)
     export BLUESKY_IDENTIFIER='your-handle.bsky.social' # Your full Bluesky handle
@@ -188,7 +188,7 @@ python socialosintlm.py
     *   **Reddit:** Usernames *without* the leading `u/`.
     *   **Hacker News:** Usernames as they appear.
     *   **Bluesky:** Full handles including `.bsky.social` (or custom domain).
-3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "Analyze recent activity patterns", "Identify key interests", "Assess communication style").
+3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "Analyse recent activity patterns", "Identify key interests", "Assess communication style").
 4.  **Commands within the analysis loop:**
     *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data.
     *   `help`: Displays available commands.
@@ -249,11 +249,11 @@ echo '{
     *   Twitter: Uses Bearer Token for potential private media access (though typically public URLs).
     *   Bluesky: Constructs authenticated CDN URLs (`cdn.bsky.app`) using the user's DID, image CID, and the session's access token.
     *   Reddit: Handles direct image links and images within Reddit Galleries (`media_metadata`).
-*   Analyzes valid downloaded images using the vision LLM.
+*   Analyses valid downloaded images using the vision LLM.
 
 ## 🔒 Security Considerations
 *   **API Keys:** Requires potentially sensitive API keys and secrets stored as environment variables or in a `.env` file. Ensure this file is secured and added to `.gitignore`.
-*   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analyzed and secure the directory appropriately.
+*   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analysed and secure the directory appropriately.
 *   **Terms of Service:** Ensure your use of the tool complies with the Terms of Service of each social media platform and the OpenRouter API. Automated querying can be subject to restrictions.
 
 ## 🤝 Contributing
