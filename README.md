@@ -2,7 +2,6 @@
 
 **SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyses user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
-
 ## 🌟 Key Features
 
 ✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), and Bluesky
@@ -19,7 +18,6 @@
 
 ✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`
 
-
 ✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`
 
 ✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
@@ -32,79 +30,98 @@
 
 ✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file
 
-
 ```mermaid
 flowchart TD
-    %% Main nodes with styling
-    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients}}
-    AA --> B{Interactive or\nStdin Mode?}
+    %% Initialization
+    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients\nVerify Environment}}:::setupClass
 
-    %% Interactive path with rounded rectangles and colors
-    B -->|Interactive| C[/Display Platform Menu/]:::menuClass
+    %% Mode Selection
+    AA --> B{Interactive or\nStdin Mode?}:::decisionClass
+
+    %% Interactive Mode Path
+    B -->|Interactive| B1([Prompt Auto-Save Setting]):::inputClass
+    B1 --> C[/Display Platform Menu/]:::menuClass
     C --> D{Platform\nSelection}:::decisionClass
+
+    %% Platform-Specific Branches
     D -->|Twitter| E1([Twitter]):::twitterClass
     D -->|Reddit| E2([Reddit]):::redditClass
     D -->|HackerNews| E3([HackerNews]):::hnClass
     D -->|Bluesky| E4([Bluesky]):::bskyClass
     D -->|Cross-Platform| E5([Multiple Platforms]):::multiClass
 
-    %% Stdin path
+    %% Stdin Mode Path
     B -->|Stdin| F([Parse JSON Input]):::inputClass
-    F --> G([Extract Platforms & Query]):::inputClass
+    F --> GA([Get Auto-Save Setting]):::inputClass
+    GA --> G([Extract Platforms & Query]):::inputClass
 
-    %% Analysis loop entry points
+    %% Analysis Loop Entry Points
     E1 & E2 & E3 & E4 & E5 --> H([Enter Analysis Loop]):::loopClass
     G --> J([Run Analysis]):::analysisClass
 
-    %% Command processing in analysis loop
+    %% Command Processing in Analysis Loop
     H -->|Query Input| I{Command\nType}:::decisionClass
     I -->|Analysis Query| J
     I -->|exit| Z([End Session]):::endClass
     I -->|refresh| Y([Force Refresh Cache]):::refreshClass
     Y --> H
 
-    %% Data fetching with cache check
+    %% Data Fetching and Caching
     J --> K{Cache\nAvailable?}:::cacheClass
     K -->|Yes| M([Load Cached Data]):::cacheClass
     K -->|No| L([Fetch Platform Data]):::apiClass
 
-    %% Rate limiting subgraph
+    %% API & Rate Limit Handling Subgraph
     subgraph API_Handling [API & Rate Limit Handling]
         direction TB
         L --> L1{Rate\nLimited?}:::errorClass
         L1 -->|Yes| L2([Handle Rate Limit]):::errorClass
         L2 --> L5([Abort or Retry]):::errorClass
         L1 -->|No| L3([Extract Text & URLs]):::dataClass
-        L3 --> L4([Save to Cache]):::cacheClass
+        L3 --> L4([Save to Cache]):::apiClass
     end
 
     L4 --> M
 
-    %% Parallel processing paths
+    %% Parallel Processing Paths
     M --> N([Process Text Data]):::textClass
     M --> O([Process Media Data]):::mediaClass
 
-    %% Media analysis subgraph
+    %% Media Analysis Pipeline Subgraph
     subgraph Media_Analysis [Media Analysis Pipeline]
         direction TB
         O --> P([Download Media Files]):::mediaClass
-        P --> Q([Image Analysis via LLM]):::llmClass
-    end
+        P --> PA{File Exists}:::decisionClass
+        PA -->|Yes| Q1([Load existing cached File]):::mediaClass
+        PA -->|No| Q([Image Analysis via LLM]):::llmClass
 
-    %% Text formatting and combining results
-    N --> S([Format Platform Text]):::textClass
+    end
     Q --> R([Collect Media Analysis]):::mediaClass
+    Q1 --> R
+
+    %% Text Formatting and Combining Results
+    N --> S([Format Platform Text]):::textClass
 
     R & S --> T([Combine All Data]):::dataClass
 
-    %% Final analysis and output
+    %% Final Analysis and Output
     T --> U([Call Analysis LLM with Query]):::llmClass
     U --> V([Format Analysis Results]):::outputClass
+     %% Auto-Save Decision
+    V --> V1{Auto-Save \nEnabled?}:::decisionClass
 
-    V --> W([Display/Save Results]):::outputClass
-    W --> H
+    %% Handle Saving
+    V1 -->|Yes| WA([Save Results Automatically]):::outputClass
+    WA --> H
+    V1 -->|No| WB{Prompt User to Save?}:::decisionClass
+    WB --> |Yes|WC([Save Results]):::outputClass
+    WC --> H
+    WB --> |No| H
 
-    %% Custom styling with improved contrast
+    %% Result display for each save option
+    %% Result display for each save option
+    GA --> V1
+    %% Custom Styling
     classDef defaultClass fill:#FFFFFF,stroke:#333,stroke-width:1px,color:#000
     classDef menuClass fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px,color:#000
     classDef decisionClass fill:#FFF9C4,stroke:#FBC02D,stroke-width:2px,color:#000
@@ -126,10 +143,12 @@ flowchart TD
     classDef mediaClass fill:#F48FB1,stroke:#AD1457,stroke-width:2px,color:#000
     classDef llmClass fill:#FFCC80,stroke:#EF6C00,stroke-width:2px,color:#000
     classDef outputClass fill:#F0F4C3,stroke:#827717,stroke-width:2px,color:#000
+    classDef setupClass fill:#D1C4E9,stroke:#4527A0,stroke-width:2px,color:#000
 
     %% Style all nodes with default class if not otherwise specified
     class A,AA,B defaultClass
 ```
+
 ## 🛠 Installation
 
 ### Prerequisites
@@ -168,10 +187,10 @@ flowchart TD
     export OPENROUTER_API_KEY='your_openrouter_api_key'
 
     # --- AI Model Selection (OpenRouter Compatible) ---
-    # Model for text analysis (e.g., claude-3-haiku, gpt-4o-mini)
-    export ANALYSIS_MODEL='anthropic/claude-3-haiku-20240307'
-    # Vision-capable model for image analysis (e.g., claude-3-opus, gpt-4-vision)
-    export IMAGE_ANALYSIS_MODEL='anthropic/claude-3-opus-20240229' # Must support vision
+    # Model for text analysis
+    export ANALYSIS_MODEL='google/gemini-2.0-flash-001'
+    # Vision-capable model for image analysis
+    export IMAGE_ANALYSIS_MODEL='openai/gpt-4o-mini' # Must support vision
     ```
     *Note: The script automatically loads variables from a `.env` file if present.*
 
