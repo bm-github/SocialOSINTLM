@@ -1,6 +1,6 @@
 # 🚀 SocialOSINTLM
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyses user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 ## 🌟 Key Features
 
@@ -10,15 +10,15 @@
 
 ✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style
 
-✅ **Vision-Capable Image Analysis:** Analyses downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
+✅ **Vision-Capable Image Analysis:** analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
 
 ✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1024x1024) for analysis
 
-✅ **Cross-Account Comparison:** Analyse profiles across multiple selected platforms simultaneously
+✅ **Cross-Account Comparison:** analyze profiles across multiple selected platforms simultaneously
 
 ✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`
 
-✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`
+✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyzes. Media files are cached in `data/media/`
 
 ✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
 
@@ -26,7 +26,7 @@
 
 ✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 30 tweets, 20 Reddit submissions, 30 Reddit comments, 50 HN items, ~300 Bluesky posts) to balance depth and API usage
 
-✅ **Detailed Logging:** Logs errors and operational details to `analyser.log`
+✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`
 
 ✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file
 
@@ -207,7 +207,7 @@ python socialosintlm.py
     *   **Reddit:** Usernames *without* the leading `u/`.
     *   **Hacker News:** Usernames as they appear.
     *   **Bluesky:** Full handles including `.bsky.social` (or custom domain).
-3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "Analyse recent activity patterns", "Identify key interests", "Assess communication style").
+3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "analyze recent activity patterns", "Identify key interests", "Assess communication style").
 4.  **Commands within the analysis loop:**
     *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data.
     *   `help`: Displays available commands.
@@ -248,7 +248,7 @@ echo '{
 *   **Rate Limits:** Detects API rate limits. For Twitter, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally.
 *   **API Errors:** Handles common platform-specific errors (e.g., user not found (`tweepy.NotFound`), forbidden access (`tweepy.Forbidden`), general request issues (`prawcore.exceptions.RequestException`, `exceptions.AtProtocolError`)).
 *   **Media Download Errors:** Logs issues during media download or processing.
-*   **Logging:** Detailed errors and warnings are logged to `analyser.log` for debugging.
+*   **Logging:** Detailed errors and warnings are logged to `analyzer.log` for debugging.
 
 ## 🤖 AI Analysis Details
 *   **Text Analysis:**
@@ -268,11 +268,11 @@ echo '{
     *   Twitter: Uses Bearer Token for potential private media access (though typically public URLs).
     *   Bluesky: Constructs authenticated CDN URLs (`cdn.bsky.app`) using the user's DID, image CID, and the session's access token.
     *   Reddit: Handles direct image links and images within Reddit Galleries (`media_metadata`).
-*   Analyses valid downloaded images using the vision LLM.
+*   analyzes valid downloaded images using the vision LLM.
 
 ## 🔒 Security Considerations
 *   **API Keys:** Requires potentially sensitive API keys and secrets stored as environment variables or in a `.env` file. Ensure this file is secured and added to `.gitignore`.
-*   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analysed and secure the directory appropriately.
+*   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analyzed and secure the directory appropriately.
 *   **Terms of Service:** Ensure your use of the tool complies with the Terms of Service of each social media platform and the OpenRouter API. Automated querying can be subject to restrictions.
 
 ## 🤝 Contributing

@@ -29,7 +29,7 @@ load_dotenv()  # Load .env file if available
 logging.basicConfig(
     level=logging.WARN,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('analyser.log'), logging.StreamHandler()]
+    handlers=[logging.FileHandler('analyzer.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger('SocialOSINTLM')
 
@@ -123,7 +123,7 @@ class SocialOSINTLM:
                     headers={
                         "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
                         "HTTP-Referer": "http://localhost:3000", # Replace with your actual referrer if applicable
-                        "X-Title": "Social Media Analyser",
+                        "X-Title": "Social Media analyzer",
                         "Content-Type": "application/json"
                     },
                     timeout=60.0 # Increased timeout for potentially long LLM calls
@@ -281,7 +281,7 @@ class SocialOSINTLM:
             logger.error(f"Media download failed for {url}: {str(e)}", exc_info=False)
             return None
 
-    def _analyse_image(self, file_path: Path, context: str = "") -> Optional[str]:
+    def _analyze_image(self, file_path: Path, context: str = "") -> Optional[str]:
         """Analyzes image using OpenRouter, handles resizing and errors."""
         if not file_path or not file_path.exists():
             logger.warning(f"Image analysis skipped: file path invalid or missing ({file_path})")
@@ -609,7 +609,7 @@ class SocialOSINTLM:
                              if url:
                                  media_path = self._download_media(url=url, platform='twitter', username=username)
                                  if media_path:
-                                     analysis = self._analyse_image(media_path, f"Twitter user @{username}'s tweet")
+                                     analysis = self._analyze_image(media_path, f"Twitter user @{username}'s tweet")
                                      tweet_data['media'].append({
                                          'type': media.type,
                                          'analysis': analysis,
@@ -751,7 +751,7 @@ class SocialOSINTLM:
                     if hasattr(submission, 'url') and submission.url and any(submission.url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
                          media_path = self._download_media(url=submission.url, platform='reddit', username=username)
                          if media_path:
-                             analysis = self._analyse_image(media_path, f"Reddit user u/{username}'s post in r/{submission.subreddit.display_name}")
+                             analysis = self._analyze_image(media_path, f"Reddit user u/{username}'s post in r/{submission.subreddit.display_name}")
                              submission_data['media'].append({
                                  'type': 'image', 'analysis': analysis, 'url': submission.url, 'local_path': str(media_path)
                              })
@@ -773,7 +773,7 @@ class SocialOSINTLM:
                                      image_url = image_url.replace('&amp;', '&')
                                      media_path = self._download_media(url=image_url, platform='reddit', username=username)
                                      if media_path:
-                                         analysis = self._analyse_image(media_path, f"Reddit user u/{username}'s gallery post in r/{submission.subreddit.display_name}")
+                                         analysis = self._analyze_image(media_path, f"Reddit user u/{username}'s gallery post in r/{submission.subreddit.display_name}")
                                          submission_data['media'].append({
                                              'type': 'gallery_image', 'analysis': analysis, 'url': image_url, 'local_path': str(media_path)
                                          })
@@ -1050,7 +1050,7 @@ class SocialOSINTLM:
 
                                 media_path = self._download_media(url=cdn_url, platform='bluesky', username=username)
                                 if media_path:
-                                    analysis = self._analyse_image(media_path, f"Bluesky user {username}'s post ({post.uri})")
+                                    analysis = self._analyze_image(media_path, f"Bluesky user {username}'s post ({post.uri})")
                                     post_data['media'].append({
                                         'type': 'image',
                                         'analysis': analysis,
@@ -1264,10 +1264,10 @@ class SocialOSINTLM:
 
     # --- Analysis Core ---
 
-    def analyse(self, platforms: Dict[str, Union[str, List[str]]], query: str) -> str:
+    def analyze(self, platforms: Dict[str, Union[str, List[str]]], query: str) -> str:
         """Collects data (using fetch methods) and performs LLM analysis."""
         collected_text_summaries = []
-        all_media_analyses = []
+        all_media_analyzes = []
         failed_fetches = []
 
         platform_count = sum(len(v) if isinstance(v, list) else 1 for v in platforms.values())
@@ -1302,7 +1302,7 @@ class SocialOSINTLM:
                             summary = self._format_text_data(platform, username, data)
                             collected_text_summaries.append(summary)
                             # Collect media analysis only from successful fetches
-                            all_media_analyses.extend(data.get('media_analysis', []))
+                            all_media_analyzes.extend(data.get('media_analysis', []))
                             logger.info(f"Successfully collected data for {platform}/{username}")
                         else:
                             # Fetcher returned None, imply failure handled internally (rate limit, not found etc)
@@ -1339,24 +1339,24 @@ class SocialOSINTLM:
 
 
             # --- Prepare for LLM Analysis ---
-            if not collected_text_summaries and not all_media_analyses:
+            if not collected_text_summaries and not all_media_analyzes:
                 return "[red]No data successfully collected from any platform. Analysis cannot proceed.[/red]"
 
             # De-duplicate media analysis strings (simple set conversion)
-            unique_media_analyses = sorted(list(set(all_media_analyses)))
+            unique_media_analyzes = sorted(list(set(all_media_analyzes)))
 
             analysis_components = []
             image_model = os.getenv('IMAGE_ANALYSIS_MODEL', 'google/gemini-pro-vision') # Get model used
             text_model = os.getenv('ANALYSIS_MODEL', 'mistralai/mixtral-8x7b-instruct') # Get text model
 
             # Add Media Analysis Section (if any)
-            if unique_media_analyses:
+            if unique_media_analyzes:
                  media_summary = f"## Consolidated Media Analysis (using {image_model}):\n\n"
                  media_summary += "*Note: The following are objective descriptions based on visual content analysis.*\n\n"
                  # Use numbered list for clarity
-                 media_summary += "\n".join(f"{i+1}. {analysis.strip()}" for i, analysis in enumerate(unique_media_analyses))
+                 media_summary += "\n".join(f"{i+1}. {analysis.strip()}" for i, analysis in enumerate(unique_media_analyzes))
                  analysis_components.append(media_summary)
-                 logger.debug(f"Added {len(unique_media_analyses)} unique media analyses to prompt.")
+                 logger.debug(f"Added {len(unique_media_analyzes)} unique media analyzes to prompt.")
 
             # Add Text Data Section (if any)
             if collected_text_summaries:
@@ -1369,19 +1369,19 @@ class SocialOSINTLM:
             # System prompt remains the same as before
             system_prompt = """**Objective:** Generate a comprehensive behavioral and linguistic profile based on the provided social media data, employing structured analytic techniques focused on objectivity, evidence-based reasoning, and clear articulation.
 
-**Input:** You will receive summaries of user activity (text posts, engagement metrics, descriptive analyses of images shared) from platforms like Twitter, Reddit, Bluesky, and Hacker News for one or more specified users. The user will also provide a specific analysis query. You may also receive consolidated analyses of images shared by the user(s).
+**Input:** You will receive summaries of user activity (text posts, engagement metrics, descriptive analyzes of images shared) from platforms like Twitter, Reddit, Bluesky, and Hacker News for one or more specified users. The user will also provide a specific analysis query. You may also receive consolidated analyzes of images shared by the user(s).
 
-**Primary Task:** Address the user's specific analysis query using ALL the data provided (text summaries AND image analyses) and the analytical framework below.
+**Primary Task:** Address the user's specific analysis query using ALL the data provided (text summaries AND image analyzes) and the analytical framework below.
 
 **Analysis Domains (Use these to structure your thinking and response where relevant to the query):**
 1.  **Behavioral Patterns:** Analyze interaction frequency, platform-specific activity (e.g., retweets vs. posts, submissions vs. comments), potential engagement triggers, and temporal communication rhythms apparent *in the provided data*. Note differences across platforms if multiple are present.
 2.  **Semantic Content & Themes:** Identify recurring topics, keywords, and concepts. Analyze linguistic indicators such as expressed sentiment/tone (positive, negative, neutral, specific emotions if clear), potential ideological leanings *if explicitly stated or strongly implied by language/topics*, and cognitive framing (how subjects are discussed). Assess information source credibility *only if* the user shares external links/content within the provided data AND you can evaluate the source based on common knowledge.
 3.  **Interests & Network Context:** Deduce primary interests, hobbies, or professional domains suggested by post content and image analysis. Note any interaction patterns visible *within the provided posts* (e.g., frequent replies to specific user types, retweets of particular accounts, participation in specific communities like subreddits). Avoid inferring broad influence or definitive group membership without strong evidence.
 4.  **Communication Style:** Assess linguistic complexity (simple/complex vocabulary, sentence structure), use of jargon/slang, rhetorical strategies (e.g., humor, sarcasm, argumentation), markers of emotional expression (e.g., emoji use, exclamation points, emotionally charged words), and narrative consistency across platforms.
-5.  **Visual Data Integration:** Explicitly incorporate insights derived from the provided image analyses. How do the visual elements (settings, objects, activities depicted) complement, contradict, or add context to the textual data? Note any patterns in the *types* of images shared.
+5.  **Visual Data Integration:** Explicitly incorporate insights derived from the provided image analyzes. How do the visual elements (settings, objects, activities depicted) complement, contradict, or add context to the textual data? Note any patterns in the *types* of images shared.
 
 **Analytical Constraints & Guidelines:**
-*   **Evidence-Based:** Ground ALL conclusions *strictly and exclusively* on the provided source materials (text summaries AND image analyses). Reference specific examples or patterns from the data (e.g., "Frequent posts about [topic] on Reddit," "Image analysis of setting suggests [environment]," "Consistent use of technical jargon on HackerNews").
+*   **Evidence-Based:** Ground ALL conclusions *strictly and exclusively* on the provided source materials (text summaries AND image analyzes). Reference specific examples or patterns from the data (e.g., "Frequent posts about [topic] on Reddit," "Image analysis of setting suggests [environment]," "Consistent use of technical jargon on HackerNews").
 *   **Objectivity & Neutrality:** Maintain analytical neutrality. Avoid speculation, moral judgments, personal opinions, or projecting external knowledge not present in the data. Focus on describing *what the data shows*.
 *   **Synthesize, Don't Just List:** Integrate findings from different platforms and data types (text/image) into a coherent narrative that addresses the query. Highlight correlations or discrepancies.
 *   **Address the Query Directly:** Structure your response primarily around answering the user's specific question(s). Use the analysis domains as tools to build your answer.
@@ -1426,7 +1426,7 @@ class SocialOSINTLM:
                         err_details = f"API HTTP {self._analysis_exception.response.status_code}"
                         # Avoid printing potentially huge response text directly to console
                         logger.error(f"Analysis API Error Response: {self._analysis_exception.response.text}")
-                        err_details += " (See analyser.log for full response)"
+                        err_details += " (See analyzer.log for full response)"
                         # Check for common user-facing errors
                         try:
                              error_data = self._analysis_exception.response.json()
@@ -1467,7 +1467,7 @@ class SocialOSINTLM:
 
 
         except RateLimitExceededError as rle:
-             # This might be raised from _handle_rate_limit during image analysis inside analyse()
+             # This might be raised from _handle_rate_limit during image analysis inside analyze()
              # Or potentially if the analysis LLM itself gets rate limited
              self.console.print(f"[bold red]Analysis Aborted: {rle}[/bold red]")
              return f"[red]Analysis aborted due to rate limiting: {rle}[/red]"
@@ -1662,13 +1662,13 @@ class SocialOSINTLM:
             self._analysis_exception = e
 
 
-    def _save_output(self, content: str, query: str, platforms_analysed: List[str], format_type: str = "markdown"):
+    def _save_output(self, content: str, query: str, platforms_analyzed: List[str], format_type: str = "markdown"):
         """Saves the analysis report to a file."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = self.base_dir / 'outputs'
         # Create a safe filename base from query and platforms
         safe_query = "".join(c if c.isalnum() else '_' for c in query[:30])
-        safe_platforms = "_".join(sorted(platforms_analysed))[:20]
+        safe_platforms = "_".join(sorted(platforms_analyzed))[:20]
         filename_base = f"analysis_{timestamp}_{safe_platforms}_{safe_query}"
 
         try:
@@ -1679,7 +1679,7 @@ class SocialOSINTLM:
                     "analysis_metadata": {
                          "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                          "query": query,
-                         "platforms_analysed": platforms_analysed,
+                         "platforms_analyzed": platforms_analyzed,
                          "output_format": "json",
                          "text_model": os.getenv('ANALYSIS_MODEL', 'unknown'),
                          "image_model": os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')
@@ -1692,7 +1692,7 @@ class SocialOSINTLM:
                 # Add metadata as comments/frontmatter to markdown
                 md_metadata = f"""---
 Query: {query}
-Platforms: {', '.join(platforms_analysed)}
+Platforms: {', '.join(platforms_analyzed)}
 Timestamp: {datetime.now(timezone.utc).isoformat()}
 Text Model: {os.getenv('ANALYSIS_MODEL', 'unknown')}
 Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
@@ -1725,8 +1725,8 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
     def run(self):
         """Runs the interactive command-line interface."""
         self.console.print(Panel(
-            "[bold blue]Social Media OSINT Analyser[/bold blue]\n"
-            "Collects and analyses user activity across multiple platforms using LLMs.\n"
+            "[bold blue]Social Media OSINT analyzer[/bold blue]\n"
+            "Collects and analyzes user activity across multiple platforms using LLMs.\n"
             "Ensure API keys and identifiers are set in your `.env` file.",
             title="Welcome",
             border_style="blue"
@@ -1825,7 +1825,7 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                 else:
                     break
 
-        self.console.print("[blue]Exiting Social Media Analyser.[/blue]")
+        self.console.print("[blue]Exiting Social Media analyzer.[/blue]")
 
 
     def _run_analysis_loop(self, platforms: Dict[str, List[str]]):
@@ -1867,7 +1867,7 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                         "- `exit`: End this analysis session and return to platform selection.\n"
                         "- `refresh`: Force a full data fetch for all current targets, ignoring cache.\n"
                         "- `help`: Show this help message.\n\n"
-                        "**To Analyse:**\n"
+                        "**To analyze:**\n"
                         "Simply type your analysis question (e.g., 'What are the main topics discussed?', 'Identify potential location clues from images and text.')",
                         title="Help", border_style="blue", expand=False
                     ))
@@ -1901,7 +1901,7 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
                 # --- Perform Analysis ---
                 self.console.print(f"[cyan]Starting analysis for query:[/cyan] '{query}'", highlight=False)
-                analysis_result = self.analyse(platforms, query)
+                analysis_result = self.analyze(platforms, query)
 
                 # Display and handle saving based on auto-save flag
                 if analysis_result:
@@ -1987,7 +1987,7 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                  raise ValueError("No valid platforms or usernames found in the processed input.")
 
             # Run analysis (will handle internal progress etc.)
-            analysis_report = self.analyse(valid_platforms, query)
+            analysis_report = self.analyze(valid_platforms, query)
 
             if analysis_report:
                  is_error = analysis_report.strip().startswith(("[red]", "[yellow]"))
@@ -2008,7 +2008,7 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                  else:
                     # Analysis failed or produced error message
                     self.console.print(f"[bold red]Analysis failed or produced an error report:[/bold red]")
-                    self.console.print(analysis_report) # Print the error message from analyse()
+                    self.console.print(analysis_report) # Print the error message from analyze()
                     sys.exit(1) # Failure exit code
             else:
                 # Analysis returned nothing at all
@@ -2035,7 +2035,7 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Social Media OSINT Analyser using LLMs. Fetches user data from various platforms, performs text and image analysis, and generates reports.",
+        description="Social Media OSINT analyzer using LLMs. Fetches user data from various platforms, performs text and image analysis, and generates reports.",
         formatter_class=argparse.RawTextHelpFormatter # Preserve newline formatting in help
     )
     parser.add_argument(
@@ -2079,17 +2079,17 @@ if __name__ == "__main__":
     # # Configure root logger too, or specific libraries if needed
     # logging.basicConfig(level=log_level, # Apply to root logger
     #                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    #                     handlers=[logging.FileHandler('analyser.log'), logging.StreamHandler()])
+    #                     handlers=[logging.FileHandler('analyzer.log'), logging.StreamHandler()])
 
     try:
         # Pass the parsed args to the constructor
-        analyser = SocialOSINTLM(args=args)
+        analyzer = SocialOSINTLM(args=args)
         if args.stdin:
             # process_stdin already uses self.args.format, but now needs self.args.no_auto_save check
-            analyser.process_stdin(args.format)
+            analyzer.process_stdin(args.format)
         else:
             # run -> _run_analysis_loop needs access to self.args
-            analyser.run()
+            analyzer.run()
 
     except RuntimeError as e:
          # Catch critical setup errors during initialization
