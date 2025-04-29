@@ -1,10 +1,10 @@
 # 🚀 SocialOSINTLM
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastadon and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 ## 🌟 Key Features
 
-✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), and Bluesky
+✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), Mastadon and Bluesky
 
 ✅ **AI-Powered Analysis:** Utilises configurable models via the OpenRouter API for sophisticated text and image analysis
 
@@ -48,7 +48,8 @@ flowchart TD
     D -->|Reddit| E2([Reddit]):::redditClass
     D -->|HackerNews| E3([HackerNews]):::hnClass
     D -->|Bluesky| E4([Bluesky]):::bskyClass
-    D -->|Cross-Platform| E5([Multiple Platforms]):::multiClass
+    D -->|Mastadon| E5([Mastadon]):::mastadonClass
+    D -->|Cross-Platform| E6([Multiple Platforms]):::multiClass
 
     %% Stdin Mode Path
     B -->|Stdin| F([Parse JSON Input]):::inputClass
@@ -56,7 +57,7 @@ flowchart TD
     GA --> G([Extract Platforms & Query]):::inputClass
 
     %% Analysis Loop Entry Points
-    E1 & E2 & E3 & E4 & E5 --> H([Enter Analysis Loop]):::loopClass
+    E1 & E2 & E3 & E4 & E5 & E6--> H([Enter Analysis Loop]):::loopClass
     G --> J([Run Analysis]):::analysisClass
 
     %% Command Processing in Analysis Loop
@@ -129,6 +130,7 @@ flowchart TD
     classDef redditClass fill:#FF5700,stroke:#8D2202,stroke-width:2px,color:#FFF
     classDef hnClass fill:#FF6600,stroke:#7F3300,stroke-width:2px,color:#FFF
     classDef bskyClass fill:#66BB6A,stroke:#1B5E20,stroke-width:2px,color:#FFF
+    classDef mastadonClass fill:#66BB6A,stroke:#1B5E20,stroke-width:2px,color:#FFF
     classDef multiClass fill:#4DB6AC,stroke:#004D40,stroke-width:2px,color:#FFF
     classDef inputClass fill:#E3F2FD,stroke:#1976D2,stroke-width:2px,color:#000
     classDef loopClass fill:#CE93D8,stroke:#6A1B9A,stroke-width:2px,color:#000
@@ -181,6 +183,11 @@ flowchart TD
     # Bluesky (Generate an App Password in Bluesky settings)
     export BLUESKY_IDENTIFIER='your-handle.bsky.social' # Your full Bluesky handle
     export BLUESKY_APP_SECRET='xxxx-xxxx-xxxx-xxxx' # Your generated App Password
+
+    # Mastadon (Generate an App Password in Bluesky settings)
+    export MASTODON_API_BASE_URL='https://mastodon.example'
+    export MASTODON_ACCESS_TOKEN='YourActualTokenValueHere'
+
 
     # --- AI Analysis API ---
     # OpenRouter (Get API Key from https://openrouter.ai)
