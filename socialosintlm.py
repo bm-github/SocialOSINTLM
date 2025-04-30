@@ -12,20 +12,18 @@ from functools import lru_cache
 import httpx
 import tweepy
 import praw
-import prawcore # Added for specific exception handling
-# +++ Mastodon Imports +++
+import prawcore
 from mastodon import Mastodon, MastodonError, MastodonNotFoundError, MastodonRatelimitError, MastodonUnauthorizedError, MastodonVersionError
-from bs4 import BeautifulSoup # For cleaning toot HTML
-# --- End Mastodon Imports ---
+from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TaskID
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.prompt import Prompt, Confirm
 import base64
-from urllib.parse import quote_plus, urlparse # Added urlparse
+from urllib.parse import quote_plus, urlparse
 from PIL import Image
-from atproto import Client, exceptions as atproto_exceptions # Renamed for clarity
+from atproto import Client, exceptions as atproto_exceptions
 from dotenv import load_dotenv
 
 load_dotenv()  # Load .env file if available
@@ -45,7 +43,6 @@ INITIAL_FETCH_LIMIT = 50 # How many items to fetch on first run or force_refresh
 INCREMENTAL_FETCH_LIMIT = 50 # How many items to fetch during incremental updates
 MASTODON_FETCH_LIMIT = 40 # Mastodon API max is often 40
 
-# --- Custom Exceptions ---
 class RateLimitExceededError(Exception):
     pass
 
@@ -61,6 +58,35 @@ class DateTimeEncoder(json.JSONEncoder):
         if isinstance(obj, datetime):
             return obj.isoformat()
         return super().default(obj)
+
+# --- Helper Function (Moved to Global Scope) ---
+def get_sort_key(item: Dict[str, Any], dt_key: str) -> datetime:
+    """Safely gets and parses a datetime string or object for sorting."""
+    dt_val = item.get(dt_key)
+    if isinstance(dt_val, str):
+        try:
+            # Handle ISO format strings (including 'Z' for UTC)
+            if dt_val.endswith('Z'):
+                dt_val = dt_val[:-1] + '+00:00'
+            return datetime.fromisoformat(dt_val)
+        except ValueError: # Handle cases where conversion might fail
+            logger.warning(f"Could not parse datetime string: {dt_val}")
+            return datetime.min.replace(tzinfo=timezone.utc)
+    elif isinstance(dt_val, datetime):
+         # Ensure timezone for comparison if needed
+         return dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
+    # Fallback for missing/invalid keys or other types (like timestamps)
+    elif isinstance(dt_val, (int, float)):
+         try:
+             # Attempt to treat as UNIX timestamp
+             return datetime.fromtimestamp(dt_val, tz=timezone.utc)
+         except (ValueError, OSError): # OSError can occur for out-of-range timestamps
+              logger.warning(f"Could not convert timestamp: {dt_val}")
+              return datetime.min.replace(tzinfo=timezone.utc)
+
+    logger.debug(f"Using fallback datetime for key '{dt_key}' with value type: {type(dt_val)}")
+    return datetime.min.replace(tzinfo=timezone.utc) # Fallback for missing/invalid keys
+
 
 # --- Main Class ---
 class SocialOSINTLM:
@@ -157,10 +183,18 @@ class SocialOSINTLM:
     def openrouter(self) -> httpx.Client:
         if not hasattr(self, '_openrouter'):
             try:
+                # --- Check for OpenRouter API Key (related to 401 errors during image analysis) ---
+                api_key = os.environ.get('OPENROUTER_API_KEY')
+                # --- Optional Debugging: Uncomment the line below to check if the key is read ---
+                # print(f"DEBUG: OpenRouter Key read from env: {'Yes' if api_key else 'No'}")
+                if not api_key:
+                    raise KeyError("OPENROUTER_API_KEY not found in environment variables. Check your .env file.")
+                # --- End Check ---
+
                 self._openrouter = httpx.Client(
                     base_url="https://openrouter.ai/api/v1",
                     headers={
-                        "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                        "Authorization": f"Bearer {api_key}", # Use the verified key
                         "HTTP-Referer": "http://localhost:3000", # Replace with your actual referrer if applicable
                         "X-Title": "Social Media analyzer",
                         "Content-Type": "application/json"
@@ -239,7 +273,12 @@ class SocialOSINTLM:
         elif isinstance(exception, atproto_exceptions.AtProtocolError) and 'rate limit' in str(exception).lower(): # Use alias
              reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
         else:
-             reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
+             # Check specifically for OpenRouter rate limit (often HTTP 429)
+             if isinstance(exception, httpx.HTTPStatusError) and exception.response.status_code == 429:
+                 reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
+                 error_message = f"Image Analysis ({platform}) API rate limit exceeded." # More specific message
+             else:
+                 reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
 
 
         self.console.print(Panel(
@@ -283,26 +322,28 @@ class SocialOSINTLM:
             # Platform-specific adjustments for AUTHENTICATION
             # Mastodon media URLs are typically public CDN links, no special auth needed usually.
             # The existing logic only adds auth for Twitter/Bluesky, so it should be fine.
+            auth_headers = {}
             if platform == 'twitter':
                 if not hasattr(self, '_twitter'): self.twitter
-                auth_header = {'Authorization': f'Bearer {os.environ["TWITTER_BEARER_TOKEN"]}'}
-                if headers: headers.update(auth_header)
-                else: headers = auth_header
+                token = os.getenv('TWITTER_BEARER_TOKEN')
+                if token: auth_headers['Authorization'] = f'Bearer {token}'
             elif platform == 'bluesky':
                  if not hasattr(self, '_bluesky_client'): self.bluesky
                  # Accessing protected member, consider refactoring if possible
                  access_token = getattr(self.bluesky._session, 'access_jwt', None)
-                 if not access_token: raise RuntimeError("Bluesky access token not available for download.")
-                 auth_header = {'Authorization': f"Bearer {access_token}"}
-                 if headers: headers.update(auth_header)
-                 else: headers = auth_header
-                 url = url.replace('http://', 'https://')
-                 if '@' in url:
-                     url = url.split('@')[0] + '@jpeg'
+                 if not access_token:
+                     logger.warning("Bluesky access token not available for media download.")
+                 else:
+                     auth_headers['Authorization'] = f"Bearer {access_token}"
+                 # CDN URL adjustments are handled in fetch_bluesky now
+
+            # Combine provided headers with auth headers
+            request_headers = headers.copy() if headers else {}
+            request_headers.update(auth_headers)
 
 
             with httpx.Client(follow_redirects=True, timeout=REQUEST_TIMEOUT) as client:
-                resp = client.get(url, headers=headers)
+                resp = client.get(url, headers=request_headers) # Use combined headers
                 resp.raise_for_status()
 
             content_type = resp.headers.get('content-type', '').lower().split(';')[0]
@@ -344,8 +385,10 @@ class SocialOSINTLM:
              logger.debug(f"Skipping analysis for non-image file: {file_path}")
              return None
 
+        temp_path = None # Define outside try block
+        analysis_file_path = file_path # Default to original path
+
         try:
-            temp_path = None
             with Image.open(file_path) as img:
                 # Format check (redundant with extension check, but safer)
                 if img.format.lower() not in ['jpeg', 'png', 'webp', 'gif']:
@@ -359,10 +402,13 @@ class SocialOSINTLM:
                 if scale_factor < 1.0:
                     new_size = (int(img.size[0] * scale_factor), int(img.size[1] * scale_factor))
                     # Handle animated GIFs - analyze only the first frame
-                    if img.format.lower() == 'gif' and getattr(img, 'is_animated', False):
+                    is_animated = getattr(img, 'is_animated', False) and img.n_frames > 1
+                    if is_animated:
                          img.seek(0) # Go to first frame
+
                     img = img.resize(new_size, Image.Resampling.LANCZOS)
                     temp_path = file_path.with_suffix('.resized.jpg')
+                    # Ensure RGB mode before saving as JPEG
                     if img.mode in ("RGBA", "P"):
                         img = img.convert("RGB")
                     img.save(temp_path, 'JPEG', quality=85)
@@ -371,28 +417,20 @@ class SocialOSINTLM:
                 else:
                     # Convert non-JPEG formats for consistency (including first frame of GIF)
                     if img.format.lower() != 'jpeg':
+                         is_animated = getattr(img, 'is_animated', False) and img.n_frames > 1
                          temp_path = file_path.with_suffix('.converted.jpg')
-                         if img.format.lower() == 'gif' and getattr(img, 'is_animated', False):
-                             img.seek(0)
+                         if is_animated:
+                             img.seek(0) # Go to first frame
                          if img.mode in ("RGBA", "P"):
                              img = img.convert("RGB")
                          img.save(temp_path, 'JPEG', quality=90)
                          analysis_file_path = temp_path
                          logger.debug(f"Converted image to JPEG for analysis: {file_path} -> {temp_path}")
-                    else:
-                        analysis_file_path = file_path
-
+                    # else: analysis_file_path remains file_path (original JPEG)
 
             base64_image = base64.b64encode(analysis_file_path.read_bytes()).decode('utf-8')
 
-            # Clean up temporary file if created
-            if temp_path and temp_path.exists():
-                 try:
-                    temp_path.unlink()
-                 except OSError as e:
-                     logger.warning(f"Could not delete temporary analysis file {temp_path}: {e}")
-
-
+            # --- Call OpenRouter ---
             prompt_text = (
                  f"Perform an objective OSINT analysis of this image originating from {context}. Focus *only* on visually verifiable elements relevant to profiling or context understanding. Describe:\n"
                  "- **Setting/Environment:** (e.g., Indoor office, outdoor urban street, natural landscape, specific room type if identifiable). Note weather, time of day clues, architecture if distinctive.\n"
@@ -407,7 +445,7 @@ class SocialOSINTLM:
 
             model_to_use = os.getenv('IMAGE_ANALYSIS_MODEL', 'google/gemini-pro-vision') # Default if not set
 
-            response = self.openrouter.post(
+            response = self.openrouter.post( # Use the property to get initialized client
                 "/chat/completions",
                 json={
                     "model": model_to_use,
@@ -424,12 +462,15 @@ class SocialOSINTLM:
                     "max_tokens": 1024 # Allow longer response for detailed analysis
                 }
             )
-            response.raise_for_status() # Check for HTTP errors first
+            response.raise_for_status() # Check for HTTP errors first (will raise on 401 etc.)
             result = response.json()
 
             # Check for API-level errors sometimes returned in a 200 OK response
             if 'error' in result:
-                 logger.error(f"Image analysis API error: {result['error'].get('message', 'Unknown error')}")
+                 # Log the specific error message from the API
+                 err_msg = result['error'].get('message', 'Unknown error detail')
+                 err_code = result['error'].get('code', 'N/A')
+                 logger.error(f"Image analysis API error (Code: {err_code}): {err_msg}")
                  return None
             if 'choices' not in result or not result['choices'] or 'message' not in result['choices'][0] or 'content' not in result['choices'][0]['message']:
                 logger.error(f"Invalid image analysis API response structure: {result}")
@@ -439,7 +480,7 @@ class SocialOSINTLM:
             logger.debug(f"Image analysis successful for: {file_path}")
             return analysis_text
 
-        except (IOError, Image.DecompressionBombError) as img_err:
+        except (IOError, Image.DecompressionBombError, SyntaxError) as img_err: # Added SyntaxError for corrupt images
              logger.error(f"Image processing error for {file_path}: {str(img_err)}")
              return None
         except httpx.RequestError as req_err:
@@ -448,13 +489,29 @@ class SocialOSINTLM:
         except httpx.HTTPStatusError as status_err:
             model_to_use = os.getenv('IMAGE_ANALYSIS_MODEL', 'google/gemini-pro-vision')
             if status_err.response.status_code == 429:
-                 self._handle_rate_limit(f"Image Analysis ({model_to_use})", status_err) # Should raise RateLimitExceededError
+                 # Pass the model name for clearer rate limit message
+                 self._handle_rate_limit(model_to_use, status_err) # Should raise RateLimitExceededError
+            # --- Explicitly check for 401 Unauthorized ---
+            elif status_err.response.status_code == 401:
+                 # This is where the original error likely occurred
+                 logger.error(f"HTTP 401 Unauthorized during image analysis ({model_to_use}). Check your OPENROUTER_API_KEY.")
+                 logger.error(f"API Response: {status_err.response.text}") # Log API response
+                 # Don't raise RateLimitExceededError here, it's an auth failure
             else:
-                 logger.error(f"HTTP error {status_err.response.status_code} during image analysis: {status_err.response.text}")
-            return None
+                 logger.error(f"HTTP error {status_err.response.status_code} during image analysis ({model_to_use}): {status_err.response.text}")
+            return None # Return None for HTTP errors other than rate limits
         except Exception as e:
             logger.error(f"Unexpected error during image analysis for {file_path}: {str(e)}", exc_info=True) # Log full traceback for unexpected errors
             return None
+        finally:
+            # Clean up temporary file if created, regardless of success/failure
+            if temp_path and temp_path.exists():
+                 try:
+                    temp_path.unlink()
+                    logger.debug(f"Deleted temporary analysis file: {temp_path}")
+                 except OSError as e:
+                     logger.warning(f"Could not delete temporary analysis file {temp_path}: {e}")
+
 
     # --- Cache Management ---
     @lru_cache(maxsize=128) # Cache path generation
@@ -481,7 +538,7 @@ class SocialOSINTLM:
                  # --- Existing Checks ---
                  elif platform == 'twitter': required_keys.extend(['tweets', 'user_info'])
                  elif platform == 'reddit': required_keys.extend(['submissions', 'comments', 'stats'])
-                 elif platform == 'bluesky': required_keys.extend(['posts', 'stats'])
+                 elif platform == 'bluesky': required_keys.extend(['posts', 'stats']) # profile_info is optional
                  elif platform == 'hackernews': required_keys.extend(['submissions', 'stats'])
 
                  if all(key in data for key in required_keys):
@@ -489,7 +546,7 @@ class SocialOSINTLM:
                       return data
                  else:
                      logger.warning(f"Cache file for {platform}/{username} seems incomplete. Discarding.")
-                     cache_path.unlink()
+                     cache_path.unlink(missing_ok=True) # Ensure deletion even if missing
                      return None
             else:
                 logger.info(f"Cache expired for {platform}/{username}")
@@ -519,28 +576,20 @@ class SocialOSINTLM:
                 'mastodon': ('posts', 'created_at'),
             }
 
-            # Simplified sorting logic
-            def get_sort_key(item, dt_key):
-                dt_val = item.get(dt_key)
-                if isinstance(dt_val, str):
-                    try:
-                        return datetime.fromisoformat(dt_val)
-                    except ValueError: # Handle cases where conversion might fail
-                        return datetime.min.replace(tzinfo=timezone.utc)
-                elif isinstance(dt_val, datetime):
-                     # Ensure timezone for comparison if needed, though isoformat should include it
-                     return dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
-                return datetime.min.replace(tzinfo=timezone.utc) # Fallback for missing/invalid keys
+            # *** The get_sort_key function definition was MOVED to the global scope ***
+            # *** No definition needed here anymore ***
 
             if platform in sort_key_map:
                  items_to_sort = sort_key_map[platform]
                  if isinstance(items_to_sort, list): # Like Reddit
                      for list_key, dt_key in items_to_sort:
                          if list_key in data and data[list_key]:
+                            # Call the globally defined get_sort_key function
                             data[list_key].sort(key=lambda x: get_sort_key(x, dt_key), reverse=True)
                  else: # Single list platforms
                     list_key, dt_key = items_to_sort
                     if list_key in data and data[list_key]:
+                       # Call the globally defined get_sort_key function
                        data[list_key].sort(key=lambda x: get_sort_key(x, dt_key), reverse=True)
 
 
@@ -558,8 +607,7 @@ class SocialOSINTLM:
 
     def fetch_twitter(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         # ... (existing implementation) ...
-        # No changes needed here for Mastodon
-        # ... (rest of fetch_twitter) ...
+        # Now calls the global get_sort_key correctly
         cached_data = self._load_cache('twitter', username)
 
         # Condition 1: Cache is valid, recent, and not forced refresh
@@ -580,7 +628,7 @@ class SocialOSINTLM:
             logger.info(f"Attempting incremental fetch for Twitter @{username}")
             existing_tweets = cached_data.get('tweets', [])
             # Ensure tweets are sorted newest first to get the latest ID
-            existing_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
+            existing_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             if existing_tweets:
                 since_id = existing_tweets[0]['id']
                 logger.debug(f"Using since_id: {since_id}")
@@ -623,14 +671,18 @@ class SocialOSINTLM:
             # Use pagination for potentially large number of new tweets since last check
             fetch_limit = INITIAL_FETCH_LIMIT if (force_refresh or not since_id) else INCREMENTAL_FETCH_LIMIT
             pagination_token = None
+            tweets_fetch_count = 0 # Track actual tweets fetched
 
             while True: # Loop for pagination
+                current_page_limit = min(fetch_limit - tweets_fetch_count, 100)
+                if current_page_limit <= 0: break # Stop if fetch limit reached
+
                 try:
                     # Ensure client is ready
                     if not hasattr(self, '_twitter'): self.twitter
                     tweets_response = self.twitter.get_users_tweets(
                         id=user_id,
-                        max_results=min(fetch_limit, 100), # Twitter API max is 100 per page
+                        max_results=current_page_limit,
                         since_id=since_id if not force_refresh else None, # Only use since_id for incremental
                         pagination_token=pagination_token,
                         tweet_fields=['created_at', 'public_metrics', 'attachments', 'entities'], # Added entities for URLs etc.
@@ -641,13 +693,16 @@ class SocialOSINTLM:
                     self._handle_rate_limit('Twitter', exception=e)
                     return None # Rate limit error handled, exit fetch
                 except tweepy.NotFound:
-                    raise UserNotFoundError(f"Tweets not found for user ID {user_id} (@{username}). User might be protected or deleted.")
+                    # If user existed but tweets now 404, could be deleted/suspended/protected between calls
+                    raise UserNotFoundError(f"Tweets not found for user ID {user_id} (@{username}). User might be protected or deleted after profile check.")
                 except tweepy.Forbidden as e:
                      raise AccessForbiddenError(f"Access forbidden to @{username}'s tweets (possibly protected). Details: {e}")
 
                 if tweets_response.data:
+                    page_count = len(tweets_response.data)
                     new_tweets_data.extend(tweets_response.data)
-                    logger.debug(f"Fetched {len(tweets_response.data)} new tweets page.")
+                    tweets_fetch_count += page_count
+                    logger.debug(f"Fetched {page_count} new tweets page (Total this run: {tweets_fetch_count}).")
                 if tweets_response.includes:
                     # Merge includes, especially media
                     for key, items in tweets_response.includes.items():
@@ -663,15 +718,15 @@ class SocialOSINTLM:
 
                 pagination_token = tweets_response.meta.get('next_token')
                 # Adjust loop break condition to consider actual fetched vs limit
-                if not pagination_token or len(new_tweets_data) >= fetch_limit:
-                    if pagination_token:
-                         logger.debug("Reached fetch limit, but more pages might exist.")
+                if not pagination_token or tweets_fetch_count >= fetch_limit:
+                    if pagination_token and tweets_fetch_count >= fetch_limit:
+                         logger.info(f"Reached fetch limit ({fetch_limit}) for Twitter @{username}.")
                     else:
                          logger.debug("No more pages found.")
                     break
 
 
-            logger.info(f"Fetched {len(new_tweets_data)} total new tweets for @{username}.")
+            logger.info(f"Fetched {tweets_fetch_count} total new tweets for @{username}.")
 
             # --- Process New Tweets and Media ---
             processed_new_tweets = []
@@ -687,13 +742,14 @@ class SocialOSINTLM:
                          media = all_media_objects.get(media_key)
                          if media:
                              # Prefer media.url for photos, preview_image_url otherwise (videos)
-                             url = media.url if media.type == 'photo' else media.preview_image_url
+                             # Use the url field directly if available, else preview
+                             url = media.url if media.type in ['photo', 'gif'] and media.url else media.preview_image_url
                              if url:
                                  media_path = self._download_media(url=url, platform='twitter', username=username)
                                  if media_path:
                                      # Analyze only if it's an image type we support
                                      analysis = None
-                                     if media_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                                     if media_path.suffix.lower() in supported_image_extensions:
                                          analysis = self._analyze_image(media_path, f"Twitter user @{username}'s tweet")
 
                                      media_items_for_tweet.append({
@@ -718,14 +774,20 @@ class SocialOSINTLM:
 
             # --- Combine and Prune ---
             # Ensure lists are sorted correctly before combining
-            processed_new_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
-            existing_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
+            processed_new_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
+            existing_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
 
-            combined_tweets = processed_new_tweets + existing_tweets
+            # De-duplicate based on ID before combining and pruning
+            existing_ids = {t['id'] for t in existing_tweets}
+            unique_new_tweets = [t for t in processed_new_tweets if t['id'] not in existing_ids]
+
+            combined_tweets = unique_new_tweets + existing_tweets
+            # Sort again after combining unique new ones
+            combined_tweets.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True)
             # Prune based on MAX_CACHE_ITEMS
             final_tweets = combined_tweets[:MAX_CACHE_ITEMS]
 
-            # Combine media analysis and paths (only add new ones)
+            # Combine media analysis and paths (only add new unique ones)
             final_media_analysis = newly_added_media_analysis + [m for m in existing_media_analysis if m not in newly_added_media_analysis] # Basic de-dup
             final_media_paths = list(newly_added_media_paths.union(existing_media_paths))[:MAX_CACHE_ITEMS * 2] # Limit paths too
 
@@ -759,8 +821,7 @@ class SocialOSINTLM:
 
     def fetch_reddit(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         # ... (existing implementation) ...
-        # No changes needed here for Mastodon
-        # ... (rest of fetch_reddit) ...
+        # Now calls the global get_sort_key correctly
         cached_data = self._load_cache('reddit', username)
 
         if not force_refresh and cached_data and \
@@ -781,8 +842,8 @@ class SocialOSINTLM:
             existing_submissions = cached_data.get('submissions', [])
             existing_comments = cached_data.get('comments', [])
             # Sort existing data to find the latest easily (PRAW fullname includes type prefix t1_, t3_)
-            existing_submissions.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use helper
-            existing_comments.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use helper
+            existing_submissions.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use global helper
+            existing_comments.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use global helper
 
             if existing_submissions:
                 latest_submission_fullname = f"t3_{existing_submissions[0]['id']}"
@@ -799,6 +860,7 @@ class SocialOSINTLM:
             if not hasattr(self, '_reddit'): self.reddit
             redditor = self.reddit.redditor(username)
             try:
+                # Accessing redditor.id forces a check if the user exists
                 redditor_id = redditor.id
                 logger.debug(f"Reddit user u/{username} found (ID: {redditor_id}).")
             except prawcore.exceptions.NotFound:
@@ -813,30 +875,45 @@ class SocialOSINTLM:
             newly_added_media_paths = set()
             fetch_limit = INCREMENTAL_FETCH_LIMIT # Limit incremental fetch
             count = 0
+            processed_ids = {s['id'] for s in existing_submissions} # Track existing submission IDs
 
             logger.debug("Fetching new submissions...")
             try:
                 # Fetch a batch and filter locally
-                for submission in redditor.submissions.new(limit=fetch_limit):
+                # Use 'before' parameter with latest fullname for more efficient incremental fetching
+                params = {}
+                if not force_refresh and latest_submission_fullname:
+                    params['before'] = latest_submission_fullname
+                    logger.debug(f"Fetching submissions before {latest_submission_fullname}")
+
+                for submission in redditor.submissions.new(limit=fetch_limit, params=params):
                     count += 1
                     submission_fullname = submission.fullname
-                    # Stop if we hit the latest known submission during an incremental update
-                    if not force_refresh and submission_fullname == latest_submission_fullname:
-                        logger.debug(f"Reached latest known submission {submission_fullname}. Stopping submission fetch.")
-                        break
+
+                    # Avoid reprocessing already cached submissions (shouldn't be needed with 'before', but safe)
+                    if submission.id in processed_ids:
+                        continue
+
+                    # This check is less reliable than using 'before', but keep as fallback
+                    if not force_refresh and latest_submission_fullname and submission_fullname == latest_submission_fullname:
+                         logger.debug(f"Reached latest known submission {submission_fullname} (fallback check). Stopping.")
+                         break
+
 
                     media_items_for_submission = [] # Process media first
                     media_processed_inline = False # Track if direct URL was handled
 
                     # Direct Image/GIF/Video URL (check common extensions)
-                    if hasattr(submission, 'url') and submission.url and any(submission.url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm']):
+                    supported_image_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
+                    if hasattr(submission, 'url') and submission.url and any(submission.url.lower().endswith(ext) for ext in supported_image_extensions + ['.mp4', '.webm']):
                          media_path = self._download_media(url=submission.url, platform='reddit', username=username)
                          if media_path:
                              analysis = None
-                             if media_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                             # Analyze images only
+                             if media_path.suffix.lower() in supported_image_extensions:
                                  analysis = self._analyze_image(media_path, f"Reddit user u/{username}'s post in r/{submission.subreddit.display_name}")
                              media_items_for_submission.append({
-                                 'type': 'image' if media_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif'] else 'video',
+                                 'type': 'image' if media_path.suffix.lower() in supported_image_extensions else 'video',
                                  'analysis': analysis,
                                  'url': submission.url,
                                  'local_path': str(media_path)
@@ -852,13 +929,15 @@ class SocialOSINTLM:
                         for media_id, media_item in media_metadata.items():
                              source = media_item.get('s') # Source dictionary
                              if source:
-                                 image_url = source.get('u') or source.get('gif') # URL or GIF
+                                 # Prefer highest resolution available (u or gif)
+                                 image_url = source.get('u') or source.get('gif')
                                  if image_url:
+                                     # Reddit URLs often have escaped ampersands
                                      image_url = image_url.replace('&amp;', '&')
                                      media_path = self._download_media(url=image_url, platform='reddit', username=username)
                                      if media_path:
                                          analysis = None
-                                         if media_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                                         if media_path.suffix.lower() in supported_image_extensions:
                                              analysis = self._analyze_image(media_path, f"Reddit user u/{username}'s gallery post in r/{submission.subreddit.display_name}")
                                          media_items_for_submission.append({
                                              'type': 'gallery_image',
@@ -884,24 +963,34 @@ class SocialOSINTLM:
                         # 'media_metadata' is complex, exclude from final cache unless needed
                     }
                     new_submissions_data.append(submission_data)
+                    processed_ids.add(submission.id) # Track processed ID
 
             except prawcore.exceptions.Forbidden:
                 logger.warning(f"Access forbidden while fetching submissions for u/{username}.")
-            logger.info(f"Fetched {len(new_submissions_data)} new submissions for u/{username} (scanned {count}).")
+            logger.info(f"Fetched {len(new_submissions_data)} new submissions for u/{username} (scanned approx {count}).")
 
 
             # --- Fetch New Comments ---
             new_comments_data = []
             count = 0
+            processed_comment_ids = {c['id'] for c in existing_comments} # Track existing comment IDs
             logger.debug("Fetching new comments...")
             try:
-                # Fetch a batch and filter locally
-                for comment in redditor.comments.new(limit=fetch_limit):
+                # Fetch a batch and filter locally, use 'before' param
+                params = {}
+                if not force_refresh and latest_comment_fullname:
+                    params['before'] = latest_comment_fullname
+                    logger.debug(f"Fetching comments before {latest_comment_fullname}")
+
+                for comment in redditor.comments.new(limit=fetch_limit, params=params):
                      count += 1
                      comment_fullname = comment.fullname
-                     # Stop if we hit the latest known comment during an incremental update
-                     if not force_refresh and comment_fullname == latest_comment_fullname:
-                         logger.debug(f"Reached latest known comment {comment_fullname}. Stopping comment fetch.")
+
+                     if comment.id in processed_comment_ids:
+                         continue
+
+                     if not force_refresh and latest_comment_fullname and comment_fullname == latest_comment_fullname:
+                         logger.debug(f"Reached latest known comment {comment_fullname} (fallback check). Stopping.")
                          break
 
                      new_comments_data.append({
@@ -913,20 +1002,23 @@ class SocialOSINTLM:
                          'created_utc': datetime.fromtimestamp(comment.created_utc, tz=timezone.utc),
                          'fullname': comment_fullname
                      })
+                     processed_comment_ids.add(comment.id)
+
             except prawcore.exceptions.Forbidden:
                  logger.warning(f"Access forbidden while fetching comments for u/{username}.")
-            logger.info(f"Fetched {len(new_comments_data)} new comments for u/{username} (scanned {count}).")
+            logger.info(f"Fetched {len(new_comments_data)} new comments for u/{username} (scanned approx {count}).")
 
 
             # --- Combine and Prune ---
-            new_submissions_data.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use helper
-            existing_submissions.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use helper
+            # New data is already assumed unique due to 'before' param and ID checks
             combined_submissions = new_submissions_data + existing_submissions
-            final_submissions = combined_submissions[:MAX_CACHE_ITEMS]
-
-            new_comments_data.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use helper
-            existing_comments.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use helper
             combined_comments = new_comments_data + existing_comments
+
+            # Sort combined lists before pruning
+            combined_submissions.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use global helper
+            combined_comments.sort(key=lambda x: get_sort_key(x, 'created_utc'), reverse=True) # Use global helper
+
+            final_submissions = combined_submissions[:MAX_CACHE_ITEMS]
             final_comments = combined_comments[:MAX_CACHE_ITEMS]
 
             # Combine media analysis and paths
@@ -942,8 +1034,8 @@ class SocialOSINTLM:
                 'total_comments': total_comments,
                 'submissions_with_media': submissions_with_media,
                 'total_media_items_processed': len(final_media_paths), # Count unique paths
-                'avg_submission_score': sum(s['score'] for s in final_submissions) / max(total_submissions, 1),
-                'avg_comment_score': sum(c['score'] for c in final_comments) / max(total_comments, 1)
+                'avg_submission_score': sum(s.get('score', 0) for s in final_submissions) / max(total_submissions, 1),
+                'avg_comment_score': sum(c.get('score', 0) for c in final_comments) / max(total_comments, 1)
             }
 
             # --- Prepare Final Data ---
@@ -979,8 +1071,7 @@ class SocialOSINTLM:
 
     def fetch_bluesky(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         # ... (existing implementation) ...
-        # No changes needed here for Mastodon
-        # ... (rest of fetch_bluesky) ...
+        # Now calls the global get_sort_key correctly
         cached_data = self._load_cache('bluesky', username)
 
         if not force_refresh and cached_data and \
@@ -993,16 +1084,18 @@ class SocialOSINTLM:
         existing_posts = []
         existing_media_analysis = []
         existing_media_paths = []
+        profile_info = None # Store profile info separately
 
         if not force_refresh and cached_data:
             logger.info(f"Attempting incremental fetch for Bluesky {username}")
             existing_posts = cached_data.get('posts', [])
-            existing_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
+            existing_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             if existing_posts:
                 # Use the CID of the latest post for comparison during fetch
                 latest_post_cid = existing_posts[0]['cid']
                 logger.debug(f"Latest known post CID: {latest_post_cid}")
 
+            profile_info = cached_data.get('profile_info') # Keep existing profile info
             existing_media_analysis = cached_data.get('media_analysis', [])
             existing_media_paths = cached_data.get('media_paths', [])
 
@@ -1010,24 +1103,31 @@ class SocialOSINTLM:
             # Ensure client is ready
             if not hasattr(self, '_bluesky_client'): self.bluesky
 
-            # Optional: Explicit profile check first (can help identify UserNotFound early)
-            profile_info = None
-            try:
-                 profile = self.bluesky.get_profile(actor=username)
-                 profile_info = { # Store basic profile info
-                      'did': profile.did,
-                      'handle': profile.handle,
-                      'display_name': profile.display_name,
-                      'description': profile.description,
-                      # Add other fields if desired (e.g., follower/following counts, avatar)
-                  }
-                 logger.debug(f"Bluesky profile found for {username}")
-            except atproto_exceptions.AtProtocolError as e:
-                 # Profile not found is not necessarily fatal, feed might still work?
-                 if 'Profile not found' in str(e) or 'could not resolve handle' in str(e).lower():
-                      logger.warning(f"Bluesky profile lookup failed for {username}: {e}. Attempting feed fetch anyway.")
-                 else: # Re-raise other profile lookup errors
-                      raise AccessForbiddenError(f"Error fetching Bluesky profile for {username}: {e}")
+            # --- Get Profile Info (only if missing or forced) ---
+            if not profile_info or force_refresh:
+                try:
+                     profile = self.bluesky.get_profile(actor=username)
+                     profile_info = { # Store basic profile info
+                          'did': profile.did,
+                          'handle': profile.handle,
+                          'display_name': profile.display_name,
+                          'description': profile.description,
+                          'avatar': profile.avatar,
+                          'banner': profile.banner,
+                          'followers_count': profile.followers_count,
+                          'follows_count': profile.follows_count,
+                          'posts_count': profile.posts_count
+                      }
+                     logger.debug(f"Fetched Bluesky profile info for {username}")
+                except atproto_exceptions.AtProtocolError as e:
+                     err_str = str(e).lower()
+                     if 'profile not found' in err_str or 'could not resolve handle' in err_str:
+                          raise UserNotFoundError(f"Bluesky user {username} not found.")
+                     elif 'blocked by actor' in err_str or 'blocking actor' in err_str:
+                          raise AccessForbiddenError(f"Blocked from accessing Bluesky profile for {username}.")
+                     else: # Re-raise other profile lookup errors
+                          logger.error(f"Unexpected error fetching Bluesky profile for {username}: {e}")
+                          raise AccessForbiddenError(f"Error fetching Bluesky profile for {username}: {e}")
 
 
             # --- Fetch New Posts ---
@@ -1040,23 +1140,24 @@ class SocialOSINTLM:
             total_fetched_this_run = 0
             max_fetches = INITIAL_FETCH_LIMIT if (force_refresh or not latest_post_cid) else INCREMENTAL_FETCH_LIMIT
 
-            logger.debug("Fetching new Bluesky posts...")
+            logger.debug(f"Fetching new Bluesky posts for {username}...")
             while total_fetched_this_run < max_fetches:
                 stop_fetching = False
                 try:
                     response = self.bluesky.get_author_feed(
-                        actor=username,
+                        actor=username, # Use handle/DID provided
                         cursor=cursor,
                         limit=fetch_limit_per_page
                     )
                 except atproto_exceptions.AtProtocolError as e:
-                    if 'rate limit' in str(e).lower():
+                    err_str = str(e).lower()
+                    if 'rate limit' in err_str:
                         self._handle_rate_limit('Bluesky', exception=e)
                         return None # Rate limit handled
-                    # More robust user not found / forbidden checks
-                    err_str = str(e).lower()
+                    # More robust user not found / forbidden checks during feed fetch
                     if 'could not resolve handle' in err_str or 'profile not found' in err_str:
-                         raise UserNotFoundError(f"Bluesky user {username} not found or handle cannot be resolved.")
+                         # This might occur if profile fetch succeeded but feed fails (e.g., account deleted between calls)
+                         raise UserNotFoundError(f"Bluesky user {username} not found or handle cannot be resolved during feed fetch.")
                     if 'blocked by actor' in err_str or 'blocking actor' in err_str:
                          raise AccessForbiddenError(f"Access to Bluesky user {username}'s feed is blocked.")
 
@@ -1078,29 +1179,21 @@ class SocialOSINTLM:
 
                     # Stop if we hit the latest known post during an incremental update
                     if not force_refresh and latest_post_cid and post_cid == latest_post_cid:
-                        logger.debug(f"Reached latest known post CID {post_cid}. Stopping feed fetch.")
+                        logger.info(f"Reached latest known post CID {post_cid} for Bluesky {username}. Stopping incremental fetch.")
                         stop_fetching = True
                         break # Stop processing this page
 
                     record = getattr(post, 'record', None)
                     if not record: continue # Skip if post has no record data
 
-                    created_at_str = getattr(record, 'created_at', None)
-                    created_at_dt = None
-                    if isinstance(created_at_str, str):
-                        try:
-                            if created_at_str.endswith('Z'): created_at_str = created_at_str[:-1] + '+00:00'
-                            created_at_dt = datetime.fromisoformat(created_at_str)
-                        except ValueError:
-                            logger.warning(f"Could not parse Bluesky created_at: {created_at_str}")
-                            created_at_dt = datetime.now(timezone.utc) # Fallback
-                    else: created_at_dt = datetime.now(timezone.utc) # Fallback
+                    created_at_dt = get_sort_key({'created_at': getattr(record, 'created_at', None)}, 'created_at')
 
                     # --- Process Media ---
                     media_items_for_post = []
                     embed = getattr(record, 'embed', None)
                     image_embeds_to_process = []
                     embed_type_str = 'unknown'
+                    supported_image_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif'] # Define here too
 
                     if embed:
                          embed_type_str = getattr(embed, '$type', 'unknown').split('.')[-1]
@@ -1109,28 +1202,31 @@ class SocialOSINTLM:
                          # Case 2: Record with media (app.bsky.embed.recordWithMedia)
                          media_embed = getattr(embed, 'media', None)
                          if media_embed and hasattr(media_embed, 'images'): image_embeds_to_process.extend(media_embed.images)
-                         # Case 3: Check inside nested record (e.g., quote post)
+                         # Case 3: Check inside nested record (e.g., quote post's media)
                          record_embed = getattr(embed, 'record', None)
-                         if record_embed and hasattr(record_embed, 'value'):
-                             nested_record_value = getattr(record_embed, 'value', None)
-                             if nested_record_value:
-                                 nested_embed = getattr(nested_record_value, 'embed', None)
-                                 if nested_embed and hasattr(nested_embed, 'images'): image_embeds_to_process.extend(nested_embed.images)
+                         nested_record_value = getattr(record_embed, 'record', None) # Check 'record' within 'record'
+                         if nested_record_value:
+                              nested_embed = getattr(nested_record_value, 'embed', None)
+                              if nested_embed and hasattr(nested_embed, 'images'):
+                                   image_embeds_to_process.extend(nested_embed.images)
+
 
                     # Process collected image embeds
                     for image_info in image_embeds_to_process:
                         img_blob = getattr(image_info, 'image', None)
                         if img_blob:
-                            cid_ref = getattr(img_blob, 'ref', None)
-                            cid = getattr(cid_ref, 'link', None) if cid_ref else getattr(img_blob, 'cid', None) # Check both structures
+                            # Bluesky API v0.4.0 changed blob structure (ref -> link)
+                            cid_ref = getattr(img_blob, 'ref', None) # Older structure?
+                            cid = getattr(cid_ref, 'link', None) if cid_ref else getattr(img_blob, 'cid', None) # Newer uses 'cid' directly? Let's try both
+
                             if cid:
                                 author_did = post.author.did
-                                # Use feed_fullsize or maybe even blob directly? feed_fullsize is safer.
-                                cdn_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{quote_plus(author_did)}/{cid}@jpeg"
+                                # Construct the CDN URL (ensure DID and CID are properly quoted)
+                                cdn_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{quote_plus(author_did)}/{quote_plus(cid)}@jpeg"
                                 media_path = self._download_media(url=cdn_url, platform='bluesky', username=username)
                                 if media_path:
                                     analysis = None
-                                    if media_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                                    if media_path.suffix.lower() in supported_image_extensions:
                                          analysis = self._analyze_image(media_path, f"Bluesky user {username}'s post ({post.uri})")
                                     media_items_for_post.append({
                                         'type': 'image', # Assume image for now
@@ -1141,7 +1237,7 @@ class SocialOSINTLM:
                                     })
                                     if analysis: newly_added_media_analysis.append(analysis)
                                     newly_added_media_paths.add(str(media_path))
-                            else: logger.warning(f"Could not find image CID in embed for post {post.uri}")
+                            else: logger.warning(f"Could not find image CID/link in embed for post {post.uri}")
                         else: logger.warning(f"Image embed structure missing 'image' blob for post {post.uri}")
 
                     post_data = {
@@ -1161,7 +1257,7 @@ class SocialOSINTLM:
                     processed_cids.add(post_cid)
                     total_fetched_this_run += 1
                     if total_fetched_this_run >= max_fetches:
-                        logger.info(f"Reached fetch limit ({max_fetches}) for this run.")
+                        logger.info(f"Reached fetch limit ({max_fetches}) for Bluesky {username}.")
                         stop_fetching = True
                         break # Stop processing this page
 
@@ -1176,9 +1272,13 @@ class SocialOSINTLM:
             logger.info(f"Fetched {len(new_posts_data)} new posts for Bluesky user {username}.")
 
             # --- Combine and Prune ---
-            new_posts_data.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
-            existing_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
-            combined_posts = new_posts_data + existing_posts
+            # De-duplicate based on CID before combining
+            existing_cids = {p['cid'] for p in existing_posts}
+            unique_new_posts = [p for p in new_posts_data if p['cid'] not in existing_cids]
+
+            combined_posts = unique_new_posts + existing_posts
+            # Sort again after combining
+            combined_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             final_posts = combined_posts[:MAX_CACHE_ITEMS]
 
             # Combine media analysis and paths
@@ -1228,11 +1328,18 @@ class SocialOSINTLM:
     def fetch_mastodon(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         """
         Fetches Mastodon statuses (toots) for a user.
-        Username should be in the format 'user@instance.domain' or just 'user' if
-        the target instance is the same as MASTODON_API_BASE_URL.
+        Username should be in the format 'user@instance.domain'.
         """
         # Use full username for cache key consistency
         cache_key_username = username # e.g., user@instance.social
+        supported_image_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif'] # Define here too
+
+        # Basic validation for Mastodon username format
+        if '@' not in cache_key_username or '.' not in cache_key_username.split('@')[1]:
+             logger.error(f"Invalid Mastodon username format for fetch: '{cache_key_username}'. Needs 'user@instance.domain'.")
+             # Attempt to fix if a default instance is set? Or just fail. Let's fail for now.
+             raise ValueError(f"Invalid Mastodon username format: '{cache_key_username}'. Must be 'user@instance.domain'.")
+
 
         cached_data = self._load_cache('mastodon', cache_key_username)
 
@@ -1251,7 +1358,7 @@ class SocialOSINTLM:
         if not force_refresh and cached_data:
             logger.info(f"Attempting incremental fetch for Mastodon {cache_key_username}")
             existing_posts = cached_data.get('posts', [])
-            existing_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
+            existing_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             if existing_posts:
                 since_id = existing_posts[0]['id']
                 logger.debug(f"Using since_id: {since_id}")
@@ -1268,7 +1375,10 @@ class SocialOSINTLM:
             # Only refetch user info if forced or missing
             if not user_info or force_refresh:
                 try:
-                    # account_lookup handles 'user' or 'user@instance.domain'
+                    # account_lookup handles 'user@instance.domain'
+                    # This call might fail if the instance in 'username' is different from the client's base_url
+                    # and federation is blocked or the target instance doesn't allow lookups.
+                    logger.debug(f"Looking up Mastodon account: {username} using client for {self.mastodon.api_base_url}")
                     account = self.mastodon.account_lookup(acct=username)
                     user_info = {
                         'id': account['id'],
@@ -1284,15 +1394,16 @@ class SocialOSINTLM:
                         'statuses_count': account['statuses_count'],
                         'created_at': account['created_at'] # Already datetime
                     }
-                    logger.debug(f"Fetched Mastodon user info for {cache_key_username}")
+                    logger.info(f"Fetched Mastodon user info for {cache_key_username}")
                 except MastodonNotFoundError:
-                    raise UserNotFoundError(f"Mastodon user {username} not found.")
+                    raise UserNotFoundError(f"Mastodon user {username} not found via {self.mastodon.api_base_url}.")
                 except MastodonUnauthorizedError:
-                    # Might happen for locked accounts you don't follow
-                    raise AccessForbiddenError(f"Unauthorized access to Mastodon user {username}'s info (locked account?).")
-                except MastodonVersionError:
-                    # Might happen if blocked or instance rules forbid lookup
-                    raise AccessForbiddenError(f"Forbidden from accessing Mastodon user {username}'s info (blocked?).")
+                    # Might happen for locked accounts you don't follow or instance restrictions
+                    raise AccessForbiddenError(f"Unauthorized access to Mastodon user {username}'s info (locked account / instance policy?).")
+                except MastodonVersionError as e:
+                    # Can indicate various issues including being blocked or federation problems
+                    logger.error(f"MastodonVersionError looking up {username}: {e}")
+                    raise AccessForbiddenError(f"Forbidden from accessing Mastodon user {username}'s info (blocked/federation issue?).")
 
             user_id = user_info['id']
 
@@ -1304,10 +1415,15 @@ class SocialOSINTLM:
             fetch_limit = INITIAL_FETCH_LIMIT if (force_refresh or not since_id) else INCREMENTAL_FETCH_LIMIT
             # Mastodon API max limit is typically 40, respect that
             api_limit = min(fetch_limit, MASTODON_FETCH_LIMIT)
+            processed_status_ids = {p['id'] for p in existing_posts} # Track existing status IDs
 
-            logger.debug(f"Fetching new statuses for user ID {user_id} (since_id: {since_id})")
+
+            logger.debug(f"Fetching new statuses for user ID {user_id} ({cache_key_username}) (since_id: {since_id})")
             try:
                 # account_statuses fetches newest first. Use since_id for incremental.
+                # Paginate if needed (though incremental fetch usually doesn't require > 1 page)
+                # Mastodon.py handles pagination automatically if we ask for more than api_limit
+                # Let's fetch in one go for simplicity here, assuming api_limit is enough for incremental
                 new_statuses = self.mastodon.account_statuses(
                     id=user_id,
                     limit=api_limit,
@@ -1320,16 +1436,32 @@ class SocialOSINTLM:
                  return None
             except MastodonNotFoundError: # Should not happen if account lookup succeeded, but maybe account deleted between calls
                  raise UserNotFoundError(f"Mastodon user ID {user_id} (handle: {username}) not found during status fetch.")
-            except (MastodonUnauthorizedError, MastodonVersionError):
+            except (MastodonUnauthorizedError, MastodonVersionError) as e:
+                 logger.error(f"Error fetching statuses for {username}: {e}")
                  raise AccessForbiddenError(f"Access forbidden to Mastodon user {username}'s statuses (private/blocked?).")
 
-            logger.info(f"Fetched {len(new_statuses)} new statuses for Mastodon user {cache_key_username}.")
+            logger.info(f"Fetched {len(new_statuses)} new raw statuses for Mastodon user {cache_key_username}.")
 
             # --- Process New Statuses ---
+            count_added = 0
             for status in new_statuses:
+                status_id = status['id']
+                # Skip if already processed (safeguard against API overlap or since_id issues)
+                if status_id in processed_status_ids:
+                    continue
+
                 # Clean HTML content using BeautifulSoup
-                soup = BeautifulSoup(status['content'], 'html.parser')
-                cleaned_text = soup.get_text(separator=' ', strip=True)
+                cleaned_text = '[Content Warning Hidden]' if status.get('spoiler_text') else ''
+                if not cleaned_text: # Only parse if not hidden by CW
+                    try:
+                         soup = BeautifulSoup(status['content'], 'html.parser')
+                         # Add space between paragraphs, breaks etc.
+                         for br in soup.find_all("br"): br.replace_with("\n")
+                         for p in soup.find_all("p"): p.append("\n")
+                         cleaned_text = soup.get_text(separator=' ', strip=True)
+                    except Exception as parse_err:
+                         logger.warning(f"HTML parsing failed for status {status_id}: {parse_err}. Using raw content.")
+                         cleaned_text = status['content'] # Fallback
 
                 # --- Process Media ---
                 media_items_for_post = []
@@ -1338,15 +1470,17 @@ class SocialOSINTLM:
                      preview_url = attachment.get('preview_url') # Lower res preview
                      media_type = attachment.get('type', 'unknown') # image, video, gifv, audio
 
-                     # Prefer full URL if available
-                     url_to_download = media_url if media_url else preview_url
+                     # Prefer full URL if available and it's not a video (sometimes URL is missing for video)
+                     url_to_download = media_url if media_url and media_type != 'video' else preview_url
                      if url_to_download:
                          media_path = self._download_media(url=url_to_download, platform='mastodon', username=cache_key_username)
                          if media_path:
                              analysis = None
                              # Only analyze supported image types
-                             if media_type == 'image' and media_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
-                                 analysis = self._analyze_image(media_path, f"Mastodon user {cache_key_username}'s post ({status['url']})")
+                             if media_type == 'image' and media_path.suffix.lower() in supported_image_extensions:
+                                 # Pass context including the status URL for reference
+                                 image_context = f"Mastodon user {cache_key_username}'s post ({status.get('url', status_id)})"
+                                 analysis = self._analyze_image(media_path, image_context)
 
                              media_items_for_post.append({
                                  'type': media_type,
@@ -1359,8 +1493,11 @@ class SocialOSINTLM:
                              if analysis: newly_added_media_analysis.append(analysis)
                              newly_added_media_paths.add(str(media_path))
 
+                is_reblog = status.get('reblog') is not None
+                reblog_info = status.get('reblog') if is_reblog else None
+
                 post_data = {
-                    'id': status['id'],
+                    'id': status_id,
                     'created_at': status['created_at'], # Already datetime
                     'url': status['url'], # Link to the status
                     'text_html': status['content'], # Raw HTML content
@@ -1369,16 +1506,23 @@ class SocialOSINTLM:
                     'reblogs_count': status.get('reblogs_count', 0),
                     'favourites_count': status.get('favourites_count', 0),
                     'replies_count': status.get('replies_count', 0),
-                    'is_reblog': status.get('reblog') is not None, # Check if it's a boost
-                    'reblog_original_author': status['reblog']['account']['acct'] if status.get('reblog') else None, # Author of boosted toot
+                    'is_reblog': is_reblog,
+                    'reblog_original_author': reblog_info['account']['acct'] if reblog_info else None,
+                    'reblog_original_url': reblog_info['url'] if reblog_info else None,
                     'media': media_items_for_post
                 }
                 new_posts_data.append(post_data)
+                processed_status_ids.add(status_id) # Track added ID
+                count_added += 1
+
+            logger.info(f"Processed {count_added} new unique statuses for Mastodon user {cache_key_username}.")
+
 
             # --- Combine and Prune ---
-            new_posts_data.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
-            existing_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
+            # New data is already unique based on ID checks
             combined_posts = new_posts_data + existing_posts
+            # Sort combined list before pruning
+            combined_posts.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             final_posts = combined_posts[:MAX_CACHE_ITEMS]
 
             # Combine media analysis and paths
@@ -1397,6 +1541,7 @@ class SocialOSINTLM:
                 'total_reblogs': total_reblogs,
                 'posts_with_media': posts_with_media,
                 'total_media_items_processed': len(final_media_paths),
+                # Calculate stats only on original posts to avoid inflating interaction counts from boosts
                 'avg_favourites': sum(p['favourites_count'] for p in original_posts) / max(total_original_posts, 1),
                 'avg_reblogs': sum(p['reblogs_count'] for p in original_posts) / max(total_original_posts, 1),
                 'avg_replies': sum(p['replies_count'] for p in original_posts) / max(total_original_posts, 1)
@@ -1416,6 +1561,9 @@ class SocialOSINTLM:
             logger.info(f"Successfully updated Mastodon cache for {cache_key_username}. Total posts cached: {total_posts}")
             return final_data
 
+        except ValueError as ve: # Catch the format validation error
+             logger.error(f"Mastodon fetch failed for {username}: {ve}")
+             return None
         except RateLimitExceededError:
             return None # Handled
         except (UserNotFoundError, AccessForbiddenError) as user_err:
@@ -1433,8 +1581,7 @@ class SocialOSINTLM:
 
     def fetch_hackernews(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         # ... (existing implementation) ...
-        # No changes needed here for Mastodon
-        # ... (rest of fetch_hackernews) ...
+        # Now calls the global get_sort_key correctly
         cached_data = self._load_cache('hackernews', username)
 
         if not force_refresh and cached_data and \
@@ -1449,7 +1596,7 @@ class SocialOSINTLM:
         if not force_refresh and cached_data:
             logger.info(f"Attempting incremental fetch for HackerNews {username}")
             existing_submissions = cached_data.get('submissions', [])
-            existing_submissions.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
+            existing_submissions.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             if existing_submissions:
                 # Find the max timestamp_i from the existing data
                 latest_timestamp_i = max(s.get('created_at_i', 0) for s in existing_submissions)
@@ -1462,10 +1609,11 @@ class SocialOSINTLM:
             hits_per_page = INITIAL_FETCH_LIMIT if (force_refresh or not latest_timestamp_i) else INCREMENTAL_FETCH_LIMIT
             params = {
                 "tags": f"author_{quote_plus(username)}",
-                "hitsPerPage": hits_per_page
+                "hitsPerPage": hits_per_page,
+                "typoTolerance": False # Be strict with username matching
             }
 
-            # Add numeric filter for incremental fetch
+            # Add numeric filter for incremental fetch - fetch items created *after* the latest known timestamp
             if not force_refresh and latest_timestamp_i > 0:
                 params["numericFilters"] = f"created_at_i>{latest_timestamp_i}"
                 logger.debug(f"Applying numeric filter: created_at_i > {latest_timestamp_i}")
@@ -1481,13 +1629,21 @@ class SocialOSINTLM:
             if 'hits' not in data:
                  logger.warning(f"No 'hits' found in HN Algolia response for {username}")
                  data['hits'] = []
+            # Check if Algolia thinks the user exists but returned 0 hits
+            elif not data['hits'] and data.get('nbHits', 0) == 0 and data.get('exhaustiveNbHits', True):
+                 # Only raise UserNotFound if we're sure Algolia found nothing for this author tag
+                 # Note: This might trigger if user exists but has 0 posts/comments.
+                 # Consider if this is the desired behavior or if an empty result is acceptable.
+                 # For now, let's proceed with empty data, which the analysis can handle.
+                 logger.info(f"HackerNews user {username} found via Algolia, but has 0 items.")
 
-            logger.info(f"Fetched {len(data['hits'])} potential new submissions for HN user {username}.")
+
+            logger.info(f"Fetched {len(data['hits'])} potential new items for HN user {username}.")
 
             for hit in data.get('hits', []):
                 object_id = hit.get('objectID')
                 if not object_id or object_id in processed_ids:
-                     continue
+                     continue # Skip duplicates
 
                 created_at_ts = hit.get('created_at_i')
                 if not created_at_ts: continue # Skip if no timestamp
@@ -1498,6 +1654,11 @@ class SocialOSINTLM:
                 elif 'comment' in tags: item_type = 'comment'
                 elif 'poll' in tags: item_type = 'poll'
                 elif 'pollopt' in tags: item_type = 'pollopt'
+
+                # Clean up text (remove HTML tags) if present
+                raw_text = hit.get('story_text') or hit.get('comment_text') or ''
+                cleaned_text = BeautifulSoup(raw_text, 'html.parser').get_text(separator=' ', strip=True) if raw_text else ''
+
 
                 submission_item = {
                     'objectID': object_id,
@@ -1510,15 +1671,16 @@ class SocialOSINTLM:
                     'parent_id': hit.get('parent_id'),
                     'created_at_i': created_at_ts,
                     'created_at': datetime.fromtimestamp(created_at_ts, tz=timezone.utc),
-                    'text': hit.get('story_text') or hit.get('comment_text') or ''
+                    'text': cleaned_text # Use cleaned text
                 }
                 new_submissions_data.append(submission_item)
                 processed_ids.add(object_id)
 
             # --- Combine and Prune ---
-            new_submissions_data.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use helper
-            # existing_submissions are already sorted
+            # New data is already unique due to ID check
             combined_submissions = new_submissions_data + existing_submissions
+            # Sort combined list before pruning
+            combined_submissions.sort(key=lambda x: get_sort_key(x, 'created_at'), reverse=True) # Use global helper
             final_submissions = combined_submissions[:MAX_CACHE_ITEMS]
 
             # --- Calculate Stats ---
@@ -1549,13 +1711,19 @@ class SocialOSINTLM:
             if e.response.status_code == 429:
                 self._handle_rate_limit('HackerNews (Algolia)', e)
             elif e.response.status_code == 400:
+                 # This can happen with invalid tag syntax (e.g., bad characters in username)
                  logger.error(f"HN Algolia API Bad Request (400) for {username}: {e.response.text}. Check username format.")
+                 # It's unlikely the user exists if the tag is invalid
+                 raise UserNotFoundError(f"HackerNews username '{username}' resulted in a bad request (check format).")
             else:
                  logger.error(f"HN Algolia API HTTP error for {username}: {e.response.status_code} - {e.response.text}")
             return None
         except httpx.RequestError as e:
              logger.error(f"HN Algolia API network error for {username}: {str(e)}")
              return None
+        except UserNotFoundError as e: # Re-raise specific UserNotFound if detected above
+             logger.error(f"HN fetch failed for {username}: {e}")
+             raise e
         except Exception as e:
             logger.error(f"Unexpected error fetching HackerNews data for {username}: {str(e)}", exc_info=True)
             return None
@@ -1597,8 +1765,8 @@ class SocialOSINTLM:
                     display_name = ""
                     if platform == 'twitter': display_name = f"@{username}"
                     elif platform == 'reddit': display_name = f"u/{username}"
-                    elif platform == 'mastodon': display_name = f"{username}" # Already user@instance
-                    elif platform == 'bluesky': display_name = f"{username}" # Handle
+                    # Mastodon/Bluesky/HN display usernames as entered
+                    elif platform in ['mastodon', 'bluesky', 'hackernews']: display_name = username
                     else: display_name = username # Default
 
                     task_desc = f"[cyan]Fetching {platform} for {display_name}..."
@@ -1611,7 +1779,9 @@ class SocialOSINTLM:
                             summary = self._format_text_data(platform, username, data)
                             collected_text_summaries.append(summary)
                             # Collect media analysis only from successful fetches
-                            all_media_analyzes.extend(data.get('media_analysis', []))
+                            # Filter out None/empty strings immediately
+                            media_analyses = [ma for ma in data.get('media_analysis', []) if ma]
+                            all_media_analyzes.extend(media_analyses)
                             logger.info(f"Successfully collected data for {platform}/{display_name}")
                         else:
                             # Fetcher returned None, imply failure handled internally (rate limit, not found etc)
@@ -1619,15 +1789,17 @@ class SocialOSINTLM:
                              logger.warning(f"Data fetch returned None for {platform}/{display_name}")
 
                     except RateLimitExceededError as rle:
-                        failed_fetches.append((platform, display_name, f"Rate Limited ({rle})"))
+                        # This error is already logged and printed by _handle_rate_limit
+                        failed_fetches.append((platform, display_name, f"Rate Limited")) # Simpler message
                     except (UserNotFoundError, AccessForbiddenError) as afe:
-                         failed_fetches.append((platform, display_name, f"Access Error ({afe})"))
+                         # These errors are logged by the fetchers
+                         failed_fetches.append((platform, display_name, f"Access Error ({type(afe).__name__})"))
                          self.console.print(f"[yellow]Skipping {platform}/{display_name}: {afe}[/yellow]")
                     except Exception as e:
                         # Catch unexpected errors during fetch call
                         fetch_error_msg = f"Unexpected error during fetch for {platform}/{display_name}: {e}"
                         logger.error(fetch_error_msg, exc_info=True)
-                        failed_fetches.append((platform, display_name, fetch_error_msg))
+                        failed_fetches.append((platform, display_name, "Unexpected fetch error"))
                         self.console.print(f"[red]Error fetching {platform}/{display_name}: {e}[/red]")
                     finally:
                          # Ensure progress advances even if username processing fails inside loop
@@ -1636,8 +1808,10 @@ class SocialOSINTLM:
 
             # Make sure progress stops cleanly even if loop finishes early
             if collect_task in self.progress.task_ids:
-                 self.progress.update(collect_task, completed=platform_count) # Mark as fully complete
-                 self.progress.remove_task(collect_task)
+                 # Ensure the task is marked as completed (fixes potential display issues)
+                 self.progress.update(collect_task, completed=platform_count, description="[green]Data collection finished.")
+                 # Optionally remove the task after completion
+                 # self.progress.remove_task(collect_task)
             if self.progress.live.is_started: # Check if started before stopping
                  self.progress.stop()
 
@@ -1654,7 +1828,8 @@ class SocialOSINTLM:
                 return "[red]No data successfully collected from any platform. Analysis cannot proceed.[/red]"
 
             # De-duplicate media analysis strings (simple set conversion)
-            unique_media_analyzes = sorted([m for m in list(set(all_media_analyzes)) if m]) # Filter out None/empty
+            # Ensure only non-empty strings are included
+            unique_media_analyzes = sorted(list(set(filter(None, all_media_analyzes))))
 
             analysis_components = []
             image_model = os.getenv('IMAGE_ANALYSIS_MODEL', 'google/gemini-pro-vision') # Get model used
@@ -1664,6 +1839,7 @@ class SocialOSINTLM:
             if unique_media_analyzes:
                  media_summary = f"## Consolidated Media Analysis (using {image_model}):\n\n"
                  media_summary += "*Note: The following are objective descriptions based on visual content analysis.*\n\n"
+                 # Ensure analysis strings are stripped of extra whitespace before joining
                  media_summary += "\n".join(f"{i+1}. {analysis.strip()}" for i, analysis in enumerate(unique_media_analyzes))
                  analysis_components.append(media_summary)
                  logger.debug(f"Added {len(unique_media_analyzes)} unique media analyzes to prompt.")
@@ -1671,7 +1847,8 @@ class SocialOSINTLM:
             # Add Text Data Section (if any)
             if collected_text_summaries:
                  text_summary = f"## Collected Textual & Activity Data Summary:\n\n"
-                 text_summary += "\n\n---\n\n".join(collected_text_summaries) # Separate platforms clearly
+                 # Ensure summaries are stripped before joining
+                 text_summary += "\n\n---\n\n".join([s.strip() for s in collected_text_summaries]) # Separate platforms clearly
                  analysis_components.append(text_summary)
                  logger.debug(f"Added {len(collected_text_summaries)} platform text summaries to prompt.")
 
@@ -1705,9 +1882,12 @@ class SocialOSINTLM:
 
             # --- Call OpenRouter LLM ---
             analysis_task = self.progress.add_task(f"[magenta]Analyzing with {text_model}...", total=None)
-            self.progress.start() # Ensure progress active for analysis
+            # self.progress.start() # Progress should already be started, re-starting can cause issues
+
             try:
                 # Use threading to keep UI responsive during API call
+                self._analysis_response = None # Reset before thread starts
+                self._analysis_exception = None # Reset before thread starts
                 api_thread = threading.Thread(
                     target=self._call_openrouter,
                     kwargs={
@@ -1719,35 +1899,52 @@ class SocialOSINTLM:
                             ],
                             "max_tokens": 3500, # Increased slightly for potentially more data
                             "temperature": 0.5,
-                            "stream": False
+                            "stream": False # Streaming disabled for now
                         }
                     }
                 )
                 api_thread.start()
 
+                # Wait for the thread to finish while keeping the progress spinner active
                 while api_thread.is_alive():
-                    api_thread.join(0.1) # Check frequently
+                    # The join(0.1) allows the main thread to briefly yield,
+                    # keeping the Progress display updated.
+                    api_thread.join(0.1)
+                    # Update progress description slightly if desired, or just let it spin
+                    # self.progress.update(analysis_task, description=f"[magenta]Analyzing with {text_model}...")
 
+                # Stop the analysis task spinner once the thread is done
+                if analysis_task is not None and analysis_task in self.progress.task_ids:
+                      self.progress.update(analysis_task, description="[magenta]Analysis API call complete.")
+                      # Keep the task visible until results are processed or error shown
+                      # self.progress.remove_task(analysis_task)
+
+
+                # --- Check results after thread completion ---
                 if self._analysis_exception:
                     err_details = str(self._analysis_exception)
+                    # Improve error reporting for HTTPStatusError
                     if isinstance(self._analysis_exception, httpx.HTTPStatusError):
-                         err_details = f"API HTTP {self._analysis_exception.response.status_code}"
-                         logger.error(f"Analysis API Error Response: {self._analysis_exception.response.text}")
+                         err_code = self._analysis_exception.response.status_code
+                         err_details = f"API HTTP {err_code}"
+                         logger.error(f"Analysis API Error Response ({err_code}): {self._analysis_exception.response.text}")
                          err_details += " (See analyzer.log for full response)"
-                         try: # Try to get cleaner message
+                         try: # Try to get cleaner message from JSON body
                              error_data = self._analysis_exception.response.json()
                              if 'error' in error_data and 'message' in error_data['error']:
                                  err_details = f"API Error: {error_data['error']['message']}"
-                         except json.JSONDecodeError: pass # Use status code if not JSON
+                         except (json.JSONDecodeError, KeyError, AttributeError): pass # Use status code if not JSON or format unknown
 
-                    raise RuntimeError(f"Analysis API request failed: {err_details}")
+                    # Re-raise as a runtime error to be caught by the outer handler
+                    raise RuntimeError(f"Analysis API request failed: {err_details}") from self._analysis_exception
 
                 if not self._analysis_response:
+                     # This case should ideally not happen if the exception wasn't raised, but good failsafe
                      raise RuntimeError("Analysis API call completed but no response object was captured.")
 
-                # Process successful response
+                # Process successful response (outside thread)
                 response = self._analysis_response
-                response.raise_for_status()
+                response.raise_for_status() # Check status code again (redundant but safe)
 
                 response_data = response.json()
                 if 'choices' not in response_data or not response_data['choices'] or 'message' not in response_data['choices'][0] or 'content' not in response_data['choices'][0]['message']:
@@ -1760,20 +1957,28 @@ class SocialOSINTLM:
                 return final_report
 
             finally:
-                 # Ensure task is removed and progress stops even if errors occurred
+                 # Ensure task is removed and progress potentially stops *after* processing or error
                  if analysis_task is not None and analysis_task in self.progress.task_ids:
                       self.progress.remove_task(analysis_task)
-                 if self.progress.live.is_started: # Check if started before stopping
-                      self.progress.stop()
-                 # Reset state variables
+                 # Don't stop progress here, let the outer loop manage it if needed
+                 # if self.progress.live.is_started:
+                 #      self.progress.stop()
+                 # Reset state variables used by the thread
                  self._analysis_response = None
                  self._analysis_exception = None
 
 
         except RateLimitExceededError as rle:
+             # Stop progress if it's running
+             if self.progress.live.is_started: self.progress.stop()
              self.console.print(f"[bold red]Analysis Aborted: {rle}[/bold red]")
              return f"[red]Analysis aborted due to rate limiting: {rle}[/red]"
+        except RuntimeError as run_err: # Catch the re-raised API error
+             if self.progress.live.is_started: self.progress.stop()
+             self.console.print(f"[bold red]Analysis Failed: {run_err}[/bold red]")
+             return f"[red]Analysis failed: {run_err}[/red]"
         except Exception as e:
+             if self.progress.live.is_started: self.progress.stop()
              logger.error(f"Unexpected error during analysis phase: {str(e)}", exc_info=True)
              return f"[red]Analysis failed due to unexpected error: {str(e)}[/red]"
 
@@ -1804,11 +2009,11 @@ class SocialOSINTLM:
         # --- Platform Specific Formatting ---
 
         if platform == 'twitter':
-            # ... (existing twitter formatting, use helper for datetime) ...
             user_info = data.get('user_info', {})
             if user_info:
-                created_at_dt = user_info.get('created_at')
-                created_at_str = created_at_dt.strftime('%Y-%m-%d') if isinstance(created_at_dt, datetime) else 'N/A'
+                # Use get_sort_key for user creation date as well
+                created_at_dt = get_sort_key(user_info, 'created_at')
+                created_at_str = created_at_dt.strftime('%Y-%m-%d') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                 output_lines.append(f"- User Profile: '{user_info.get('name')}' ({user_prefix}{user_info.get('username')}), ID: {user_info.get('id')}, Created: {created_at_str}")
                 if user_info.get('public_metrics'):
                     pm = user_info['public_metrics']
@@ -1822,8 +2027,8 @@ class SocialOSINTLM:
                 output_lines.append("- No tweets found in fetched data.")
             else:
                 for i, t in enumerate(tweets[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(t, 'created_at') # Use helper
-                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt != datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                    created_at_dt = get_sort_key(t, 'created_at') # Use global helper
+                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                     media_count = len(t.get('media', []))
                     media_info = f" (Media Attached: {media_count})" if media_count > 0 else ""
                     text = t.get('text', '[No Text]')
@@ -1836,7 +2041,6 @@ class SocialOSINTLM:
                     )
 
         elif platform == 'reddit':
-            # ... (existing reddit formatting, use helper for datetime) ...
             stats = data.get('stats', {})
             output_lines.append(
                 f"- Activity Overview: Subs={stats.get('total_submissions', 0)}, Comments={stats.get('total_comments', 0)}, Media Posts={stats.get('submissions_with_media', 0)}, Avg Sub Score={stats.get('avg_submission_score', 0):.1f}, Avg Comment Score={stats.get('avg_comment_score', 0):.1f}"
@@ -1848,8 +2052,8 @@ class SocialOSINTLM:
                  output_lines.append("- No submissions found.")
             else:
                 for i, s in enumerate(submissions[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(s, 'created_utc') # Use helper
-                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt != datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                    created_at_dt = get_sort_key(s, 'created_utc') # Use global helper
+                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                     media_count = len(s.get('media', []))
                     media_info = f" (Media: {media_count})" if media_count > 0 else ""
                     text = s.get('text', '')
@@ -1868,8 +2072,8 @@ class SocialOSINTLM:
                  output_lines.append("- No comments found.")
             else:
                 for i, c in enumerate(comments[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(c, 'created_utc') # Use helper
-                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt != datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                    created_at_dt = get_sort_key(c, 'created_utc') # Use global helper
+                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                     text = c.get('text', '[No Text]')
                     text_snippet = text[:TEXT_SNIPPET_LENGTH] + ('...' if len(text) > TEXT_SNIPPET_LENGTH else '')
                     output_lines.append(
@@ -1879,7 +2083,6 @@ class SocialOSINTLM:
                     )
 
         elif platform == 'hackernews':
-            # ... (existing hackernews formatting, use helper for datetime) ...
             stats = data.get('stats', {})
             output_lines.append(
                 f"- Activity Overview: Items={stats.get('total_items_cached', 0)}, Stories={stats.get('total_stories', 0)}, Comments={stats.get('total_comments', 0)}, Avg Story Pts={stats.get('average_story_points', 0):.1f}, Avg Story Comments={stats.get('average_story_num_comments', 0):.1f}"
@@ -1890,11 +2093,11 @@ class SocialOSINTLM:
                 output_lines.append("- No activity found.")
             else:
                 for i, s in enumerate(submissions[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(s, 'created_at') # Use helper
-                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt != datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                    created_at_dt = get_sort_key(s, 'created_at') # Use global helper
+                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                     item_type = s.get('type', 'unknown').capitalize()
                     title = s.get('title')
-                    text = s.get('text', '')
+                    text = s.get('text', '') # Already cleaned in fetcher
                     text_snippet = text[:TEXT_SNIPPET_LENGTH] + ('...' if len(text) > TEXT_SNIPPET_LENGTH else '')
                     hn_link = f"https://news.ycombinator.com/item?id={s.get('objectID')}"
 
@@ -1904,18 +2107,26 @@ class SocialOSINTLM:
                     if text_snippet: output_lines.append(f"  Text: {text_snippet}")
                     if item_type == 'Story':
                         output_lines.append(f"  Stats: Pts={s.get('points', 0)}, Comments={s.get('num_comments', 0)}")
+                    elif item_type == 'Comment':
+                         # Add points for comments if available
+                         points = s.get('points')
+                         if points is not None:
+                              output_lines.append(f"  Stats: Pts={points}")
                     output_lines.append(f"  HN Link: {hn_link}")
 
 
         elif platform == 'bluesky':
-            # ... (existing bluesky formatting, use helper for datetime) ...
             profile = data.get('profile_info')
             if profile:
-                 output_lines.append(f"- Profile: '{profile.get('display_name')}' ({profile.get('handle')})")
-                 # Add other profile details if needed
+                 desc = profile.get('description', '').strip()
+                 desc_snippet = desc[:150] + ('...' if len(desc) > 150 else '')
+                 output_lines.append(f"- Profile: '{profile.get('display_name')}' ({profile.get('handle')}), DID: {profile.get('did')}")
+                 if desc_snippet: output_lines.append(f"  - Bio: {desc_snippet}")
+                 output_lines.append(f"  - Stats: Posts={profile.get('posts_count', 'N/A')}, Following={profile.get('follows_count', 'N/A')}, Followers={profile.get('followers_count', 'N/A')}")
+
             stats = data.get('stats', {})
             output_lines.append(
-                 f"- Activity Overview: Posts={stats.get('total_posts', 0)}, Media Posts={stats.get('posts_with_media', 0)}, Avg Likes={stats.get('avg_likes', 0):.1f}, Avg Reposts={stats.get('avg_reposts', 0):.1f}, Avg Replies={stats.get('avg_replies', 0):.1f}"
+                 f"- Cached Activity Overview: Posts={stats.get('total_posts', 0)}, Media Posts={stats.get('posts_with_media', 0)}, Avg Likes={stats.get('avg_likes', 0):.1f}, Avg Reposts={stats.get('avg_reposts', 0):.1f}, Avg Replies={stats.get('avg_replies', 0):.1f}"
             )
             posts = data.get('posts', [])
             output_lines.append(f"\n**Recent Posts (up to {MAX_ITEMS_PER_TYPE}):**")
@@ -1923,8 +2134,8 @@ class SocialOSINTLM:
                  output_lines.append("- No posts found.")
             else:
                 for i, p in enumerate(posts[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(p, 'created_at') # Use helper
-                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt != datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                    created_at_dt = get_sort_key(p, 'created_at') # Use global helper
+                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                     media_count = len(p.get('media', []))
                     media_info = f" (Media: {media_count})" if media_count > 0 else ""
                     text = p.get('text', '[No Text]')
@@ -1943,11 +2154,16 @@ class SocialOSINTLM:
         elif platform == 'mastodon':
             user_info = data.get('user_info', {})
             if user_info:
-                 created_at_dt = user_info.get('created_at')
-                 created_at_str = created_at_dt.strftime('%Y-%m-%d') if isinstance(created_at_dt, datetime) else 'N/A'
-                 # Clean bio HTML
-                 bio_soup = BeautifulSoup(user_info.get('note_html', ''), 'html.parser')
-                 bio_text = bio_soup.get_text(separator=' ', strip=True)
+                 created_at_dt = get_sort_key(user_info, 'created_at') # Use helper for profile date too
+                 created_at_str = created_at_dt.strftime('%Y-%m-%d') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                 # Clean bio HTML using BeautifulSoup for display snippet
+                 bio_text = ''
+                 try:
+                     bio_soup = BeautifulSoup(user_info.get('note_html', ''), 'html.parser')
+                     bio_text = bio_soup.get_text(separator=' ', strip=True)
+                 except Exception: # Catch potential BS4 errors
+                     bio_text = user_info.get('note_html', '[Could not parse bio]') # Fallback
+
                  bio_snippet = bio_text[:150] + ('...' if len(bio_text) > 150 else '')
 
                  output_lines.append(
@@ -1960,7 +2176,7 @@ class SocialOSINTLM:
 
             stats = data.get('stats', {})
             output_lines.append(
-                 f"- Activity Overview (Cached): Posts={stats.get('total_posts_cached',0)}, Originals={stats.get('total_original_posts',0)}, Boosts={stats.get('total_reblogs',0)}, Media Posts={stats.get('posts_with_media', 0)}, Avg Favs={stats.get('avg_favourites', 0):.1f}, Avg Boosts={stats.get('avg_reblogs', 0):.1f}"
+                 f"- Cached Activity Overview: Posts={stats.get('total_posts_cached',0)}, Originals={stats.get('total_original_posts',0)}, Boosts={stats.get('total_reblogs',0)}, Media Posts={stats.get('posts_with_media', 0)}, Avg Favs={stats.get('avg_favourites', 0):.1f}, Avg Boosts={stats.get('avg_reblogs', 0):.1f}"
             )
 
             posts = data.get('posts', [])
@@ -1969,8 +2185,8 @@ class SocialOSINTLM:
                 output_lines.append("- No posts found in fetched data.")
             else:
                 for i, p in enumerate(posts[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(p, 'created_at') # Use helper
-                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt != datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
+                    created_at_dt = get_sort_key(p, 'created_at') # Use global helper
+                    created_at_str = created_at_dt.strftime('%Y-%m-%d %H:%M') if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else 'N/A'
                     media_count = len(p.get('media', []))
                     media_info = f" (Media: {media_count})" if media_count > 0 else ""
                     spoiler = p.get('spoiler_text', '')
@@ -1978,12 +2194,15 @@ class SocialOSINTLM:
                     is_boost = p.get('is_reblog', False)
                     boost_info = f" (Boost of {p.get('reblog_original_author', 'unknown')})" if is_boost else ""
 
-                    # Use cleaned text, skip if it's just a boost with no added text
+                    # Use cleaned text, provide context for boosts/CWs
                     text_snippet = p.get('text_cleaned', '')
-                    if is_boost and not text_snippet:
+                    if spoiler and not text_snippet: # Handle case where CW hides everything
+                         text_display = "[Content Warning Text Only]"
+                    elif is_boost and not text_snippet:
                          text_display = "[Boost Content Only]"
-                    else:
-                         text_display = text_snippet if text_snippet else "[No Text Content]"
+                    else: # Show snippet if available
+                         text_display = text_snippet[:TEXT_SNIPPET_LENGTH] + ('...' if len(text_snippet) > TEXT_SNIPPET_LENGTH else '')
+                         if not text_display: text_display = "[No Text Content]" # Handle empty strings
 
 
                     output_lines.append(
@@ -1992,6 +2211,10 @@ class SocialOSINTLM:
                         f"  Stats: Favs={p.get('favourites_count', 0)}, Boosts={p.get('reblogs_count', 0)}, Replies={p.get('replies_count', 0)}\n"
                         f"  Link: {p.get('url', 'N/A')}"
                     )
+                    # Optionally add link to boosted post
+                    if is_boost and p.get('reblog_original_url'):
+                         output_lines.append(f"  Original Post: {p['reblog_original_url']}")
+
         # --- End Mastodon Formatting ---
 
         else:
@@ -2004,25 +2227,30 @@ class SocialOSINTLM:
 
     def _call_openrouter(self, json_data: dict):
         """Worker function for making the OpenRouter API call in a thread."""
-        self._analysis_response = None
-        self._analysis_exception = None
+        # Reset state variables specific to this call
+        thread_response = None
+        thread_exception = None
         try:
-            # Ensure client is ready
-            if not hasattr(self, '_openrouter'): self.openrouter
-            response = self.openrouter.post("/chat/completions", json=json_data)
-            # Check for HTTP errors immediately
-            response.raise_for_status()
-            self._analysis_response = response
+            # Ensure client is ready (accessing property initializes if needed)
+            client = self.openrouter
+            thread_response = client.post("/chat/completions", json=json_data)
+            # Raise HTTP errors immediately *within the thread* so they get caught
+            thread_response.raise_for_status()
         except Exception as e:
             # Store the exception to be checked by the main thread
-            logger.error(f"OpenRouter API call error: {str(e)}")
-            if hasattr(e, 'response') and e.response:
+            logger.error(f"OpenRouter API call error in thread: {str(e)}")
+            # Log response details if it's an HTTP error
+            if isinstance(e, httpx.HTTPStatusError) and e.response:
                 logger.error(f"Response status: {e.response.status_code}")
                 try:
-                     logger.error(f"Response content: {e.response.text}") # Log full error if possible
+                     logger.error(f"Response content: {e.response.text}")
                 except Exception:
                      logger.error("Could not decode error response content.")
-            self._analysis_exception = e
+            thread_exception = e
+        finally:
+            # Set the shared instance variables *after* the call completes or fails
+            self._analysis_response = thread_response
+            self._analysis_exception = thread_exception
 
 
     def _save_output(self, content: str, query: str, platforms_analyzed: List[str], format_type: str = "markdown"):
@@ -2047,7 +2275,7 @@ class SocialOSINTLM:
                          "text_model": os.getenv('ANALYSIS_MODEL', 'unknown'),
                          "image_model": os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')
                     },
-                    "analysis_report_markdown": content # Store the markdown report
+                    "analysis_report_markdown": content # Store the raw markdown report
                 }
                 filename.write_text(json.dumps(data_to_save, indent=2), encoding='utf-8')
             else: # Default to markdown
@@ -2062,13 +2290,15 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 ---
 
 """
-                # Remove potential Rich markup before saving
-                plain_content = Markdown(content).plain # Attempt to get plain text
-                # Fallback if plain conversion is empty or fails
-                if not plain_content:
-                    # Basic regex to remove common Rich tags like [red], [/red] etc.
-                    import re
-                    plain_content = re.sub(r"\[/?([a-zA-Z]+|\#[0-9a-fA-F]{6})\]", "", content)
+                # The content should already be markdown from the LLM
+                # No need to process with Markdown() again before saving
+                # Just ensure it starts with the # OSINT Analysis Report header if present
+                if content.startswith("# OSINT Analysis Report"):
+                     plain_content = content # Assume it's good markdown
+                else:
+                     # If missing the header, add it? Or just save as is. Let's save as is.
+                     logger.warning("Saved analysis content missing expected '# OSINT Analysis Report' header.")
+                     plain_content = content
 
 
                 full_content = md_metadata + plain_content
@@ -2092,7 +2322,13 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
              available.append('bluesky')
         # +++ Add Mastodon Check +++
         if not check_creds or all(os.getenv(k) for k in ['MASTODON_ACCESS_TOKEN', 'MASTODON_API_BASE_URL']):
-             available.append('mastodon')
+             # Also do a basic URL check for Mastodon
+             base_url = os.getenv('MASTODON_API_BASE_URL')
+             if base_url and urlparse(base_url).scheme and urlparse(base_url).netloc:
+                 available.append('mastodon')
+             elif check_creds: # Only warn if checking creds and URL is bad
+                 logger.warning("Mastodon credentials found, but MASTODON_API_BASE_URL is invalid or missing.")
+
         # --- End Mastodon Check ---
         available.append('hackernews') # Always available conceptually
         return sorted(available)
@@ -2110,9 +2346,12 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
         # Get platforms with credentials actually configured
         available_platforms = self.get_available_platforms(check_creds=True)
-        if not available_platforms and 'hackernews' not in self.get_available_platforms(check_creds=False):
-            self.console.print("[bold red]Error: No API credentials found for any platform (except potentially HackerNews).[/bold red]")
-            self.console.print("Please set credentials in a `.env` file (e.g., TWITTER_BEARER_TOKEN, MASTODON_ACCESS_TOKEN etc.).")
+        # Check if only HackerNews is available (no other creds set)
+        only_hackernews = 'hackernews' in self.get_available_platforms(check_creds=False) and not any(p != 'hackernews' for p in available_platforms)
+
+        if not available_platforms and not only_hackernews:
+            self.console.print("[bold red]Error: No API credentials correctly configured for any platform.[/bold red]")
+            self.console.print("Please set credentials in a `.env` file (e.g., TWITTER_BEARER_TOKEN, MASTODON_ACCESS_TOKEN etc.) and ensure URLs are valid.")
             return # Exit if no platforms usable
 
         while True:
@@ -2120,11 +2359,13 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
             # Get currently configured platforms for the menu
             current_available = self.get_available_platforms(check_creds=True)
+            # Add HN if it's the *only* thing available conceptually, even without other creds
             if not current_available and 'hackernews' in self.get_available_platforms(check_creds=False):
-                current_available = ['hackernews'] # Only show HN if it's the *only* one available
-            elif not current_available:
-                self.console.print("[yellow]No platforms seem to be configured. Please check your .env file.[/yellow]")
-                break # Exit loop if nothing is configured
+                 current_available = ['hackernews']
+
+            if not current_available:
+                 self.console.print("[yellow]No platforms seem to be configured correctly. Please check your .env file and logs.[/yellow]")
+                 break # Exit loop if nothing is configured
 
 
             platform_priority = {
@@ -2141,10 +2382,13 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
             num_platforms = len(current_available)
             cross_platform_key = str(num_platforms + 1)
             exit_key = str(num_platforms + 2)
-            platform_options[cross_platform_key] = "cross-platform"
+            # Only offer cross-platform if more than one platform is available
+            if num_platforms > 1:
+                platform_options[cross_platform_key] = "cross-platform"
             platform_options[exit_key] = "exit"
 
             for key, name in platform_options.items():
+                 # Add config status indicator? (e.g., check if client property raises error?) - maybe too complex here
                  self.console.print(f"{key}. {name.capitalize()}")
 
             choice = Prompt.ask("Enter number(s) (e.g., 1 or 1,3 or 5 for cross-platform)", default=exit_key).strip()
@@ -2154,11 +2398,12 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
             selected_platform_keys = []
             is_cross_platform = False
-            if choice == cross_platform_key or choice.lower() == 'cross-platform':
-                 selected_platform_keys = list(platform_options.keys())[:-2] # All platforms except the last two options
+            if (cross_platform_key in platform_options) and (choice == cross_platform_key or choice.lower() == 'cross-platform'):
+                 # Select all available platforms *except* 'cross-platform' and 'exit' themselves
+                 selected_platform_keys = [k for k, v in platform_options.items() if v not in ["cross-platform", "exit"]]
                  is_cross_platform = True
                  selected_names = [platform_options[k] for k in selected_platform_keys]
-                 self.console.print(f"Selected: Cross-Platform Analysis ({', '.join(selected_names)})")
+                 self.console.print(f"Selected: Cross-Platform Analysis ({', '.join(name.capitalize() for name in selected_names)})")
             else:
                  raw_keys = [k.strip() for k in choice.split(',')]
                  valid_keys = [k for k in raw_keys if k in platform_options and k not in [cross_platform_key, exit_key]]
@@ -2187,27 +2432,37 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
                      user_input = Prompt.ask(prompt_message, default="").strip()
                      if user_input:
+                         # Split and strip, filter out empty strings
                          usernames = [u.strip() for u in user_input.split(',') if u.strip()]
-                         # +++ Mastodon Username Validation (Basic) +++
+                         if not usernames: continue # Skip if only whitespace or empty strings entered
+
+                         # +++ Mastodon Username Validation (Interactive) +++
                          if platform_name == 'mastodon':
                               valid_masto_users = []
                               for u in usernames:
                                    if '@' in u and '.' in u.split('@')[1]: # Basic check for instance part
                                        valid_masto_users.append(u)
                                    else:
-                                       # Try appending default instance from .env if exists? Or just warn.
-                                       default_instance = urlparse(os.getenv('MASTODON_API_BASE_URL', '')).netloc
-                                       if default_instance:
-                                           full_user = f"{u}@{default_instance}"
-                                           self.console.print(f"[yellow]Assuming '{u}' is on default instance: {full_user}[/yellow]")
-                                           valid_masto_users.append(full_user)
+                                       # Check if a default instance can be inferred from env var
+                                       default_instance_url = os.getenv('MASTODON_API_BASE_URL', '')
+                                       default_instance_domain = urlparse(default_instance_url).netloc if default_instance_url else None
+
+                                       if default_instance_domain:
+                                           assumed_user = f"{u}@{default_instance_domain}"
+                                           if Confirm.ask(f"[yellow]Username '{u}' lacks instance. Assume it's on '{default_instance_domain}' (i.e., '{assumed_user}')?[/yellow]", default=True):
+                                                valid_masto_users.append(assumed_user)
+                                           else:
+                                                self.console.print(f"[yellow]Skipping Mastodon username '{u}' due to missing instance.[/yellow]")
                                        else:
-                                           self.console.print(f"[bold red]Invalid Mastodon username format: '{u}'. Needs 'user@instance.domain'. Skipping.[/bold red]")
+                                           self.console.print(f"[bold red]Invalid Mastodon username format: '{u}'. Needs 'user@instance.domain'. Cannot assume default. Skipping.[/bold red]")
                               usernames = valid_masto_users # Use only validated/corrected usernames
                          # --- End Mastodon Validation ---
 
                          if usernames:
-                             platforms_to_query[platform_name] = usernames
+                             # Ensure platform_name is in dict before extending/assigning
+                             if platform_name not in platforms_to_query:
+                                 platforms_to_query[platform_name] = []
+                             platforms_to_query[platform_name].extend(usernames)
 
                 if not platforms_to_query:
                     self.console.print("[yellow]No valid usernames entered for selected platform(s). Returning to menu.[/yellow]")
@@ -2221,22 +2476,23 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                 if Confirm.ask("Exit program?", default=False):
                     break
             except RuntimeError as e:
-                 # Catch setup errors (missing keys, failed auth) during client initialization
+                 # Catch setup errors (missing keys, failed auth) during client initialization (e.g., in property getters)
                  self.console.print(f"[bold red]Configuration/Runtime Error:[/bold red] {e}")
                  self.console.print("Please check your .env file, API keys, and instance URLs.")
-                 if Confirm.ask("Try again?", default=False):
-                     continue
+                 # Don't loop infinitely on setup errors, offer exit.
+                 if not Confirm.ask("Exit program?", default=True):
+                     continue # Allow retry if user explicitly wants it
                  else:
-                     break # Exit if setup fails
+                     break
             except Exception as e:
-                logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+                logger.error(f"Unexpected error in main interactive loop: {e}", exc_info=True)
                 self.console.print(f"[bold red]An unexpected error occurred:[/bold red] {e}")
                 if Confirm.ask("Try again?", default=False):
                     continue
                 else:
                     break
 
-        self.console.print("[blue]Exiting Social Media analyzer.[/blue]")
+        self.console.print("\n[blue]Exiting Social Media analyzer.[/blue]")
 
 
     def _run_analysis_loop(self, platforms: Dict[str, List[str]]):
@@ -2299,43 +2555,54 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                                  display_name = username
                                  if platform == 'twitter': display_name = f"@{username}"
                                  elif platform == 'reddit': display_name = f"u/{username}"
+                                 # Mastodon/Bluesky/HN use username directly
 
                                  self.progress.update(refresh_task, description=f"[yellow]Refreshing {platform}/{display_name}...")
                                  try:
                                      # Call fetcher with force_refresh=True
-                                     fetcher(username=username, force_refresh=True)
-                                 except Exception as e:
+                                     # Fetcher handles its own errors (UserNotFound, RateLimit etc)
+                                     result = fetcher(username=username, force_refresh=True)
+                                     if result is None: # Indicates fetch failure handled internally
+                                         failed_refreshes.append((platform, display_name))
+                                         # Error message should have been printed by fetcher or logger
+                                 except Exception as e: # Catch unexpected fetch errors during refresh
                                      failed_refreshes.append((platform, display_name))
-                                     logger.error(f"Refresh failed for {platform}/{display_name}: {e}", exc_info=False)
-                                     self.console.print(f"[red]Refresh failed for {platform}/{display_name}: {e}[/red]")
+                                     logger.error(f"Unexpected Refresh failed for {platform}/{display_name}: {e}", exc_info=True)
+                                     self.console.print(f"[red]Unexpected Refresh failed for {platform}/{display_name}: {e}[/red]")
                                  finally:
                                       self.progress.advance(refresh_task)
 
                          # Ensure progress finishes cleanly
                          if refresh_task in self.progress.task_ids:
-                              self.progress.update(refresh_task, completed=total_targets)
-                              self.progress.remove_task(refresh_task)
+                              self.progress.update(refresh_task, completed=total_targets, description="[green]Refresh attempt finished.")
+                              # self.progress.remove_task(refresh_task) # Optional: remove task
                          if self.progress.live.is_started:
                              self.progress.stop()
 
                          if failed_refreshes:
-                              self.console.print(f"[yellow]Data refreshed, but failed for {len(failed_refreshes)} target(s).[/yellow]")
+                              self.console.print(f"[yellow]Data refresh attempted, but issues encountered for {len(failed_refreshes)} target(s) (see logs).[/yellow]")
                          else:
-                              self.console.print("[green]Data refreshed successfully for all targets.[/green]")
+                              self.console.print("[green]Data refresh attempt completed for all targets.[/green]")
                     continue # Go back to prompt after refresh attempt
 
 
                 # --- Perform Analysis ---
                 self.console.print(f"[cyan]Starting analysis for query:[/cyan] '{query}'", highlight=False)
-                analysis_result = self.analyze(platforms, query)
+                # Ensure progress is stopped before starting analysis if not already stopped
+                if self.progress.live.is_started:
+                     self.progress.stop()
+
+                # Call the main analysis function
+                analysis_result = self.analyze(platforms, query) # This now handles its own progress display
 
                 # Display and handle saving based on auto-save flag
                 if analysis_result:
-                    # Check for error markers more robustly
-                    is_error = analysis_result.strip().lower().startswith(("[red]", "[yellow]", "error:", "warning:"))
-                    border_col = "red" if analysis_result.strip().lower().startswith(("[red]", "error:")) else \
-                                 "yellow" if analysis_result.strip().lower().startswith(("[yellow]", "warning:")) else \
-                                 "green"
+                    # Check for error markers more robustly (case-insensitive, strip whitespace)
+                    result_lower_stripped = analysis_result.strip().lower()
+                    is_error = result_lower_stripped.startswith(("[red]", "error:", "analysis failed", "analysis aborted"))
+                    is_warning = result_lower_stripped.startswith(("[yellow]", "warning:"))
+
+                    border_col = "red" if is_error else ("yellow" if is_warning else "green")
 
                     # Use Markdown rendering for output display
                     self.console.print(Panel(
@@ -2348,42 +2615,45 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                     # --- Saving Logic ---
                     if not is_error: # Only attempt to save successful reports
                         save_report = False
-                        if self.args.no_auto_save:
+                        # Use self.args consistently
+                        if self.args and self.args.no_auto_save:
                              # Prompt user because auto-save is disabled
                              if Confirm.ask("Save this analysis report?", default=True):
                                  save_report = True
                         else:
-                            # Auto-save is enabled (default behavior)
-                            self.console.print(f"[cyan]Auto-saving analysis report as {self.args.format}...[/cyan]")
+                            # Auto-save is enabled (default behavior or --no-auto-save not used)
+                            save_format_arg = self.args.format if self.args else 'markdown' # Get format from args or default
+                            self.console.print(f"[cyan]Auto-saving analysis report as {save_format_arg}...[/cyan]")
                             save_report = True
 
                         if save_report:
                             # Use the format from args as the default for the prompt if needed,
                             # otherwise use the format specified in args directly.
-                            save_format = self.args.format
-                            if self.args.no_auto_save: # Only re-prompt format if auto-save was off AND user chose to save
-                                save_format = Prompt.ask("Save format?", choices=["markdown", "json"], default=self.args.format)
-                            # Pass the raw analysis_result (which might contain markdown)
+                            save_format = self.args.format if self.args else 'markdown' # Default to markdown if args missing
+                            # Only prompt if auto-save was off AND user explicitly chose to save
+                            if self.args and self.args.no_auto_save:
+                                save_format = Prompt.ask("Save format?", choices=["markdown", "json"], default=save_format)
+                            # Pass the raw analysis_result (which should be markdown)
                             self._save_output(analysis_result, query, platform_names_list, save_format)
                     # --- End Saving Logic ---
 
                 else:
-                    self.console.print("[red]Analysis returned no result.[/red]")
+                    self.console.print("[red]Analysis returned no result (None).[/red]")
 
             except (KeyboardInterrupt, EOFError):
                 self.console.print("\n[yellow]Analysis query cancelled.[/yellow]")
                 if Confirm.ask("\nExit this analysis session?", default=False):
-                    break
+                    break # Exit inner loop
             except RateLimitExceededError as rle:
-                 self.console.print(f"\n[bold red]Rate Limit Error during analysis: {rle}[/bold red]")
-                 self.console.print("[yellow]Please wait before trying again.[/yellow]")
+                 # Error already printed by handler, just inform user and maybe exit
+                 self.console.print("[yellow]Please wait for rate limit to reset before trying again.[/yellow]")
                  if Confirm.ask("Exit analysis session due to rate limit?", default=False):
-                     break
+                     break # Exit inner loop
             except Exception as e:
                  logger.error(f"Unexpected error during analysis loop: {e}", exc_info=True)
                  self.console.print(f"\n[bold red]An unexpected error occurred during analysis:[/bold red] {e}")
                  if not Confirm.ask("An error occurred. Continue session?", default=True):
-                     break
+                     break # Exit inner loop
 
 
     # --- Non-Interactive Mode (stdin processing) ---
@@ -2402,17 +2672,23 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
 
             # Validate platform usernames are lists/strings and platform is available
             valid_platforms = {}
-            available = self.get_available_platforms(check_creds=True) # Check configured platforms
+            available_configured = self.get_available_platforms(check_creds=True) # Check configured platforms
+            available_conceptual = self.get_available_platforms(check_creds=False) # Get all possible platforms
 
             for platform, usernames in platforms.items():
                  platform = platform.lower() # Normalize platform name
-                 if platform not in available:
-                     # Allow HackerNews even if not "configured"
-                     if platform == 'hackernews':
-                         logger.info(f"Platform '{platform}' allowed (no credentials required).")
-                     else:
-                         logger.warning(f"Platform '{platform}' specified in stdin is not configured or supported. Skipping.")
-                         continue
+
+                 # Check if platform is conceptually supported *and* configured (if requires creds)
+                 is_available = False
+                 if platform in available_conceptual:
+                      if platform == 'hackernews': # HN needs no config
+                           is_available = True
+                      elif platform in available_configured: # Others need config
+                           is_available = True
+
+                 if not is_available:
+                     logger.warning(f"Platform '{platform}' specified in stdin is not supported or not correctly configured. Skipping.")
+                     continue
 
                  processed_users = []
                  if isinstance(usernames, str):
@@ -2420,8 +2696,12 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                  elif isinstance(usernames, list):
                      processed_users = [u.strip() for u in usernames if isinstance(u, str) and u.strip()]
                  else:
-                     logger.warning(f"Invalid username format for platform '{platform}' in stdin. Expected string or list of strings. Skipping.")
+                     logger.warning(f"Invalid username format for platform '{platform}' in stdin. Expected string or list of strings. Skipping platform.")
                      continue # Skip platform with invalid username format
+
+                 if not processed_users:
+                     logger.warning(f"No valid usernames provided for platform '{platform}' in stdin. Skipping platform.")
+                     continue # Skip platform with no users
 
                  # +++ Add Mastodon username validation for stdin +++
                  if platform == 'mastodon':
@@ -2431,45 +2711,54 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
                              masto_users_validated.append(u)
                          else:
                              logger.warning(f"Invalid Mastodon username format in stdin for '{u}'. Needs 'user@instance.domain'. Skipping user.")
-                     processed_users = masto_users_validated
+                     processed_users = masto_users_validated # Use only valid ones
+                     if not processed_users:
+                          logger.warning(f"No valid Mastodon usernames remained for platform '{platform}' after validation. Skipping platform.")
+                          continue # Skip if validation removed all users
                  # --- End Mastodon validation ---
 
                  if processed_users:
                      valid_platforms[platform] = processed_users
 
             if not valid_platforms:
-                 raise ValueError("No valid platforms or usernames found in the processed input after validation.")
+                 raise ValueError("No valid and configured platforms with valid usernames found in the processed input.")
 
             # Run analysis
-            analysis_report = self.analyze(valid_platforms, query)
+            # Ensure progress is stopped before starting analysis
+            if self.progress.live.is_started: self.progress.stop()
+            analysis_report = self.analyze(valid_platforms, query) # Handles its own progress
 
             if analysis_report:
-                 # Check for error indicators
-                 is_error = analysis_report.strip().lower().startswith(("[red]", "[yellow]", "error:", "warning:"))
+                 # Check for error indicators (case-insensitive, stripped)
+                 result_lower_stripped = analysis_report.strip().lower()
+                 is_error = result_lower_stripped.startswith(("[red]", "error:", "analysis failed", "analysis aborted"))
 
                  if not is_error:
                     # Analysis succeeded
                     platform_names_list = sorted(valid_platforms.keys())
-                    if self.args.no_auto_save:
-                        # Print report to stdout
-                        self.console.print("[yellow]--no-auto-save flag set. Printing report to stdout instead of saving:[/yellow]")
-                        # Print using Markdown for better formatting if possible
-                        self.console.print(Markdown(analysis_report))
+                    # Check args passed to __init__ for no_auto_save
+                    if self.args and self.args.no_auto_save:
+                        # Print raw report (should be markdown) to stdout
+                        # Use print directly to avoid Rich formatting stdout for piping
+                        print(analysis_report)
                         sys.exit(0) # Success
                     else:
                         # Auto-save enabled: Save the output
                         # Pass raw markdown report to save function
-                        self._save_output(analysis_report, query, platform_names_list, self.args.format)
-                        self.console.print(f"[green]Analysis complete. Output auto-saved ({self.args.format}).[/green]")
+                        output_format_to_use = self.args.format if self.args else 'markdown' # Use arg format or default
+                        self._save_output(analysis_report, query, platform_names_list, output_format_to_use)
+                        # Print confirmation message to stderr so stdout only contains report if --no-auto-save used
+                        self.console.print(f"[green]Analysis complete. Output auto-saved ({output_format_to_use}).[/green]", file=sys.stderr)
                         sys.exit(0) # Success
                  else:
                     # Analysis failed or produced error message
-                    self.console.print(f"[bold red]Analysis failed or produced an error report:[/bold red]")
-                    self.console.print(analysis_report) # Print the error message
+                    # Print error report to stderr
+                    sys.stderr.write("[ERROR] Analysis failed or produced an error report:\n")
+                    sys.stderr.write(analysis_report + "\n")
                     sys.exit(1) # Failure
             else:
                 # Analysis returned nothing at all
-                self.console.print(f"[bold red]Analysis returned no result.[/bold red]")
+                sys.stderr.write("[ERROR] Analysis returned no result (None).\n")
                 sys.exit(1) # Failure
 
         except json.JSONDecodeError:
@@ -2483,7 +2772,11 @@ Image Model: {os.getenv('IMAGE_ANALYSIS_MODEL', 'unknown')}
         except RateLimitExceededError as rle:
              logger.error(f"Processing failed due to rate limit: {rle}")
              sys.stderr.write(f"Error: Rate limit exceeded during processing - {rle}\n")
-             sys.exit(1) # Consider specific exit code?
+             sys.exit(1)
+        except RuntimeError as rte: # Catch setup errors from analysis call
+            logger.error(f"Runtime error during stdin processing: {rte}")
+            sys.stderr.write(f"Error: Runtime error during processing - {rte}\n")
+            sys.exit(1)
         except Exception as e:
             logger.error(f"Unexpected error during stdin processing: {e}", exc_info=True)
             sys.stderr.write(f"Error: An unexpected error occurred - {e}\n")
@@ -2522,10 +2815,29 @@ if __name__ == "__main__":
     parser.add_argument(
         '--no-auto-save',
         action='store_true',
-        help="Disable automatic saving of analysis reports; prompt the user before saving in interactive mode, print to stdout in stdin mode."
+        help="Disable automatic saving of analysis reports; prompt user before saving in interactive mode, print report directly to stdout in stdin mode."
+    )
+    # Add log level argument
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        default='WARNING',
+        help='Set the logging level (default: WARNING).'
     )
 
+
     args = parser.parse_args()
+
+    # --- Configure Logging Level ---
+    log_level_numeric = getattr(logging, args.log_level.upper(), logging.WARNING)
+    logging.getLogger().setLevel(log_level_numeric)
+    logger.setLevel(log_level_numeric)
+    # Ensure handlers also respect the new level (especially file handler)
+    for handler in logging.getLogger().handlers:
+        handler.setLevel(log_level_numeric)
+    logger.info(f"Logging level set to {args.log_level}")
+    # --- End Logging Config ---
+
 
     try:
         # Pass the parsed args to the constructor
@@ -2538,7 +2850,7 @@ if __name__ == "__main__":
             analyzer.run()
 
     except RuntimeError as e:
-         # Catch critical setup errors during initialization
+         # Catch critical setup errors during initialization (e.g., missing core env vars)
          logging.getLogger('SocialOSINTLM').critical(f"Initialization failed: {e}", exc_info=False)
          # Use Rich console if available for error printing
          console = Console(stderr=True)

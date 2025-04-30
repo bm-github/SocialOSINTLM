@@ -185,8 +185,8 @@ flowchart TD
     export BLUESKY_APP_SECRET='xxxx-xxxx-xxxx-xxxx' # Your generated App Password
 
     # Mastadon (Generate an App Password in Bluesky settings)
-    export MASTODON_API_BASE_URL='https://mastodon.example'
-    export MASTODON_ACCESS_TOKEN='YourActualTokenValueHere'
+    export MASTODON_API_BASE_URL='https://mastodon.example' # Your mastadon server
+    export MASTODON_ACCESS_TOKEN='your_access_token'
 
 
     # --- AI Analysis API ---
