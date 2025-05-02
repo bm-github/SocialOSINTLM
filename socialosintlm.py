@@ -235,7 +235,7 @@ class SocialOSINTLM:
                     "BLUESKY_APP_SECRET) not set in environment."
                 )
             try:
-                client = Client(request_timeout=REQUEST_TIMEOUT)
+                client = Client()
                 client.login(identifier, secret)
                 self._bluesky_client = client
                 logger.debug("Bluesky login successful")
@@ -346,7 +346,6 @@ class SocialOSINTLM:
                     bearer_token=bearer_token,
                     wait_on_rate_limit=False,
                     # Tweepy passes timeout to underlying request lib (httpx)
-                    timeout=REQUEST_TIMEOUT,
                 )
                 # Test connection using a known, public account
                 self._twitter.get_user(username="twitterdev")
