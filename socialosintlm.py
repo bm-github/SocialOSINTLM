@@ -189,8 +189,10 @@ class SocialOSINTLM:
                 )
                 # Test connection by getting instance info
                 try:
-                     instance_info = client.instance()
-                     logger.debug(f"Connected to Mastodon instance: {instance_info['title']} ({instance_info['uri']})")
+                    instance_info = client.instance()
+                    instance_title = instance_info.get('title', 'N/A')
+                    instance_uri = instance_info.get('uri', 'URI Missing')
+                    logger.debug(f"Connected to Mastodon instance: {instance_title} ({instance_uri})")
                 except MastodonError as instance_err:
                      logger.error(f"Failed to connect to Mastodon instance {base_url}: {instance_err}")
                      # Improve error message based on common connection issues
@@ -3155,7 +3157,7 @@ class SocialOSINTLM:
                 init_ok = True
                 with self.progress: # Use progress for client init
                     init_task = self.progress.add_task("Initializing...", total=len(platforms_to_query))
-                    for platform_name in platforms_to_query.keys():
+                    for platform_name in list(platforms_to_query.keys()): # Iterate over a copy
                         self.progress.update(init_task, description=f"Initializing {platform_name.capitalize()}...")
                         try:
                             _ = getattr(self, platform_name) # Access property to trigger initialization
@@ -3558,17 +3560,17 @@ Place these in a `.env` file in the same directory or set them in your environme
         '--stdin',
         action='store_true',
         help="Read analysis request from stdin as JSON.\n"
-             "Expected JSON format example:\n"
-             '{\n'
-             '  "platforms": {\n'
-             '    "twitter": ["user1", "user2"],\n'
-             '    "reddit": "user3",\n'
-             '    "hackernews": ["user4"],\n'
-             '    "bluesky": ["handle1.bsky.social"],\n'
-             '    "mastodon": ["user@instance.social", "another@other.server"]\n'
-             '  },\n'
-             '  "query": "Analyze communication style and main topics."\n'
-             '}'
+            "Expected JSON format example:\n"
+            '{\n'
+            '  "platforms": {\n'
+            '    "twitter": ["user1", "user2"],\n'
+            '    "reddit": ["user3"],\n'
+            '    "hackernews": ["user4"],\n'
+            '    "bluesky": ["handle1.bsky.social"],\n'
+            '    "mastodon": ["user@instance.social", "another@other.server"]\n'
+            '  },\n'
+            '  "query": "Analyze communication style and main topics."\n'
+            '}'
     )
     parser.add_argument(
         '--format',
@@ -3633,118 +3635,4 @@ Place these in a `.env` file in the same directory or set them in your environme
          error_console = Console(stderr=True, style="bold red")
          error_console.print(f"\nUNEXPECTED CRITICAL ERROR: {e}")
          error_console.print("Check analyzer.log for the full traceback.")
-         sys.exit(1)
-
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Social Media OSINT analyzer using LLMs. Fetches user data from various platforms, performs text and image analysis, and generates reports.",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog="""
-Environment Variables Required:
-  OPENROUTER_API_KEY      : Your OpenRouter.ai API key.
-  IMAGE_ANALYSIS_MODEL    : Vision model on OpenRouter (e.g., google/gemini-pro-vision).
-  ANALYSIS_MODEL          : Text model on OpenRouter (e.g., mistralai/mixtral-8x7b-instruct).
-
-Platform Credentials (at least one set required, or just use HackerNews):
-  TWITTER_BEARER_TOKEN    : Twitter API v2 Bearer Token.
-  REDDIT_CLIENT_ID        : Reddit App Client ID.
-  REDDIT_CLIENT_SECRET    : Reddit App Client Secret.
-  REDDIT_USER_AGENT       : Reddit App User Agent string.
-  BLUESKY_IDENTIFIER      : Bluesky handle or DID.
-  BLUESKY_APP_SECRET      : Bluesky App Password.
-  MASTODON_ACCESS_TOKEN   : Mastodon App Access Token.
-  MASTODON_API_BASE_URL   : Mastodon instance base URL (e.g., https://mastodon.social).
-
-Place these in a `.env` file in the same directory or set them in your environment.
-"""
-    )
-    parser.add_argument(
-        '--stdin',
-        action='store_true',
-        help="Read analysis request from stdin as JSON.\n"
-             "Expected JSON format example:\n"
-             '{\n'
-             '  "platforms": {\n'
-             '    "twitter": ["user1", "user2"],\n'
-             '    "reddit": "user3",\n'
-             '    "hackernews": ["user4"],\n'
-             '    "bluesky": ["handle1.bsky.social"],\n'
-             '    "mastodon": ["user@instance.social", "another@other.server"]\n'
-             '  },\n'
-             '  "query": "Analyze communication style and main topics."\n'
-             '}'
-    )
-    parser.add_argument(
-        '--format',
-        choices=['json', 'markdown'],
-        default='markdown',
-        help="Output format for saving analysis reports (default: markdown).\n"
-             "- markdown: Saves as a .md file with YAML frontmatter.\n"
-             "- json: Saves as a .json file containing metadata and the markdown report."
-    )
-    parser.add_argument(
-        '--no-auto-save',
-        action='store_true',
-        help="Disable automatic saving of reports.\n"
-             "- Interactive mode: Prompt user before saving.\n"
-             "- Stdin mode: Print the report directly to stdout instead of saving."
-    )
-    parser.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-        default='WARNING',
-        help='Set the logging level (default: WARNING).'
-    )
-
-
-    args = parser.parse_args()
-
-    # --- Configure Logging Level ---
-    log_level_numeric = getattr(logging, args.log_level.upper(), logging.WARNING)
-    # Set level on the root logger first
-    logging.getLogger().setLevel(log_level_numeric)
-    # Set level on the specific logger for this module
-    logger.setLevel(log_level_numeric)
-    # Ensure handlers also respect the new level
-    # Create console handler with Rich support if not already present
-    # (Avoids double printing if basicConfig added StreamHandler)
-    # Check if a StreamHandler already exists
-    has_stream_handler = any(isinstance(h, logging.StreamHandler) for h in logging.getLogger().handlers)
-
-    #if not has_stream_handler: # Add RichHandler if no stream handler exists
-    #    from rich.logging import RichHandler
-    #    rich_handler = RichHandler(rich_tracebacks=True, level=log_level_numeric, console=Console(stderr=True))
-    #    logging.getLogger().addHandler(rich_handler)
-    #else: # Ensure existing handlers have the right level
-    for handler in logging.getLogger().handlers:
-        handler.setLevel(log_level_numeric)
-
-    logger.info(f"Logging level set to {args.log_level}")
-    # --- End Logging Config ---
-
-    analyzer_instance = None # Define outside try block
-    try:
-        # Pass the parsed args to the constructor
-        analyzer_instance = SocialOSINTLM(args=args)
-        if args.stdin:
-            analyzer_instance.process_stdin() # Uses self.args internally
-        else:
-            analyzer_instance.run() # Uses self.args internally
-
-    except RuntimeError as e:
-         # Catch critical setup errors during initialization (e.g., missing core env vars, client init failures)
-         logging.getLogger('SocialOSINTLM').critical(f"Initialization failed: {e}", exc_info=False)
-         console = Console(stderr=True, style="bold red")
-         console.print(f"\nCRITICAL ERROR: {e}")
-         console.print("Ensure necessary API keys (OpenRouter) and platform credentials/URLs are correctly set in .env or environment.")
-         console.print("Check analyzer.log for more details.")
-         sys.exit(1)
-    except Exception as e:
-         # Catch any other unexpected top-level errors
-         logging.getLogger('SocialOSINTLM').critical(f"An unexpected critical error occurred: {e}", exc_info=True)
-         console = Console(stderr=True, style="bold red")
-         console.print(f"\nUNEXPECTED CRITICAL ERROR: {e}")
-         console.print("Check analyzer.log for the full traceback.")
          sys.exit(1)

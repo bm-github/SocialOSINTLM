@@ -225,16 +225,16 @@ python socialosintlm.py
 Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing.
 
 ```bash
-echo '{
-  "platforms": {
-    "twitter": ["user1", "AnotherUser"],
-    "reddit": ["redditUser"],
-    "hackernews": ["hnUser"],
-    "bluesky": ["handle.bsky.social"]
-  },
-  "query": "Summarize main topics discussed and analyze sentiment across platforms.",
-  "format": "markdown"
-}' | python socialosintlm.py --stdin
+        echo '{
+        "platforms": {
+        "twitter": ["user1", "user2"],
+        "reddit": ["user3"],
+        "hackernews": ["user4"],
+        "bluesky": ["handle1.bsky.social"],
+        "mastodon": ["user@instance.social", "another@other.server"]
+        },
+        "query": "Analyze communication style and main topics."
+        }' | python socialosintlm.py --stdin
 ```
 
 ### Command-line Arguments
