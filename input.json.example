@@ -1,0 +1,11 @@
+{
+  "platforms": {
+    "twitter": ["twitterhandle"],
+    "reddit": ["reddithandle"],
+    "hackernews": ["hackernewshandle"],
+    "bluesky": ["handle.bsky.social,anotherhandle.bsky.social"],
+    "mastodon": ["handle@mastodon.social"]
+  },
+  "query": "Summarize main topics discussed and analyze sentiment across platforms.",
+  "format": "markdown"
+}
