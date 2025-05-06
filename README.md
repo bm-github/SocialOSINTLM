@@ -33,15 +33,18 @@
 ```mermaid
 flowchart TD
     %% Initialization
-    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients\nVerify Environment}}:::setupClass
+    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients
+    Verify Environment}}:::setupClass
 
     %% Mode Selection
-    AA --> B{Interactive or\nStdin Mode?}:::decisionClass
+    AA --> B{Interactive or
+    Stdin Mode?}:::decisionClass
 
     %% Interactive Mode Path
     B -->|Interactive| B1([Prompt Auto-Save Setting]):::inputClass
     B1 --> C[/Display Platform Menu/]:::menuClass
-    C --> D{Platform\nSelection}:::decisionClass
+    C --> D{Platform
+    Selection}:::decisionClass
 
     %% Platform-Specific Branches
     D -->|Twitter| E1([Twitter]):::twitterClass
@@ -61,21 +64,24 @@ flowchart TD
     G --> J([Run Analysis]):::analysisClass
 
     %% Command Processing in Analysis Loop
-    H -->|Query Input| I{Command\nType}:::decisionClass
+    H -->|Query Input| I{Command
+    Type}:::decisionClass
     I -->|Analysis Query| J
     I -->|exit| Z([End Session]):::endClass
     I -->|refresh| Y([Force Refresh Cache]):::refreshClass
     Y --> H
 
     %% Data Fetching and Caching
-    J --> K{Cache\nAvailable?}:::cacheClass
+    J --> K{Cache
+    Available?}:::cacheClass
     K -->|Yes| M([Load Cached Data]):::cacheClass
     K -->|No| L([Fetch Platform Data]):::apiClass
 
     %% API & Rate Limit Handling Subgraph
     subgraph API_Handling [API & Rate Limit Handling]
         direction TB
-        L --> L1{Rate\nLimited?}:::errorClass
+        L --> L1{Rate
+        Limited?}:::errorClass
         L1 -->|Yes| L2([Handle Rate Limit]):::errorClass
         L2 --> L5([Abort or Retry]):::errorClass
         L1 -->|No| L3([Extract Text & URLs]):::dataClass
@@ -109,7 +115,8 @@ flowchart TD
     T --> U([Call Analysis LLM with Query]):::llmClass
     U --> V([Format Analysis Results]):::outputClass
      %% Auto-Save Decision
-    V --> V1{Auto-Save \nEnabled?}:::decisionClass
+    V --> V1{Auto-Save 
+    Enabled?}:::decisionClass
 
     %% Handle Saving
     V1 -->|Yes| WA([Save Results Automatically]):::outputClass
