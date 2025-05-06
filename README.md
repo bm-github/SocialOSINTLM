@@ -53,6 +53,17 @@ flowchart TD
     D -->|Bluesky| E4([Bluesky]):::bskyClass
     D -->|Mastodon| E5([Mastodon]):::MastodonClass
     D -->|Cross-Platform| E6([Multiple Platforms]):::multiClass
+    D -->|Purge Data| P1([Select Purge Option]):::purgeClass
+
+    %% Purge Data Flow
+    P1 --> P2{Purge
+    Type?}:::decisionClass
+    P2 --> |All/Cache/Media/Outputs| P3{Confirm
+    Deletion?}:::decisionClass
+    P3 --> |Yes| P4([Delete Selected Data]):::purgeClass
+    P3 --> |No| C
+    P4 --> C
+    P2 --> |Cancel| C
 
     %% Stdin Mode Path
     B -->|Stdin| F([Parse JSON Input]):::inputClass
@@ -115,7 +126,7 @@ flowchart TD
     T --> U([Call Analysis LLM with Query]):::llmClass
     U --> V([Format Analysis Results]):::outputClass
      %% Auto-Save Decision
-    V --> V1{Auto-Save 
+    V --> V1{Auto-Save
     Enabled?}:::decisionClass
 
     %% Handle Saving
@@ -127,8 +138,8 @@ flowchart TD
     WB --> |No| H
 
     %% Result display for each save option
-    %% Result display for each save option
     GA --> V1
+
     %% Custom Styling
     classDef defaultClass fill:#FFFFFF,stroke:#333,stroke-width:1px,color:#000
     classDef menuClass fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px,color:#000
@@ -146,6 +157,7 @@ flowchart TD
     classDef refreshClass fill:#80CBC4,stroke:#004D40,stroke-width:2px,color:#000
     classDef cacheClass fill:#B2EBF2,stroke:#006064,stroke-width:2px,color:#000
     classDef apiClass fill:#C5E1A5,stroke:#33691E,stroke-width:2px,color:#000
+    classDef purgeClass fill:#FFAB91,stroke:#D84315,stroke-width:2px,color:#000
     classDef errorClass fill:#E57373,stroke:#B71C1C,stroke-width:2px,color:#000
     classDef dataClass fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#000
     classDef textClass fill:#90CAF9,stroke:#1565C0,stroke-width:2px,color:#000
