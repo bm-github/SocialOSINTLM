@@ -16,9 +16,11 @@
 
 ✅ **Cross-Account Comparison:** analyze profiles across multiple selected platforms simultaneously
 
-✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`
+✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`. Does not auto-rety.
 
 ✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyzes. Media files are cached in `data/media/`
+
+✅ **Purge data:** Purge option to clear all directories just cache, media or output.
 
 ✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
 
@@ -233,6 +235,7 @@ python socialosintlm.py
     *   **Reddit:** Usernames *without* the leading `u/`.
     *   **Hacker News:** Usernames as they appear.
     *   **Bluesky:** Full handles including `.bsky.social` (or custom domain).
+    *   **Mastodon:** Full handles including `.mastodon.social` (or custom domain).
 3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "analyze recent activity patterns", "Identify key interests", "Assess communication style").
 4.  **Commands within the analysis loop:**
     *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data.
