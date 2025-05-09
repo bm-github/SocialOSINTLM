@@ -1,36 +1,42 @@
 # 🚀 SocialOSINTLM
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon, and Bluesky**. Leveraging AI through the OpenRouter API, it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 ## 🌟 Key Features
 
-✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), Mastodon and Bluesky
+✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), Mastodon, and Bluesky.
 
-✅ **AI-Powered Analysis:** Utilises configurable models via the OpenRouter API for sophisticated text and image analysis
+✅ **AI-Powered Analysis:** Utilises configurable models via the OpenRouter API for sophisticated text and image analysis. AI calls are threaded for a responsive UI.
 
-✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style
+✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, communication style, and visual data integration.
 
-✅ **Vision-Capable Image Analysis:** analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
+✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM.
+    *   Focuses on objective details: setting, objects, people, text, activity.
+    *   Advanced Preprocessing: Handles animated GIFs (first frame), converts various image modes (e.g., RGBA, Palette) to RGB, and resizes large images (max dimension 1536px) using high-quality resampling for optimal analysis.
 
-✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1024x1024) for analysis
+✅ **Efficient Media Handling:**
+    *   Downloads media, stores it locally with content-hashed filenames.
+    *   Handles platform-specific authentication for media access where needed (e.g., Twitter Bearer, Bluesky JWT for CDN).
+    *   Processes Reddit galleries and Mastodon/Bluesky media attachments.
 
-✅ **Cross-Account Comparison:** analyze profiles across multiple selected platforms simultaneously
+✅ **Cross-Account Analysis:** Analyzes profiles across multiple selected platforms simultaneously, providing data to the LLM for potential comparative insights.
 
-✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`. Does not auto-rety.
+✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and raises `RateLimitExceededError`.
 
-✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyzes. Media files are cached in `data/media/`
+✅ **Robust Caching System:**
+    *   Caches fetched text/metadata for 24 hours in `data/cache/` to reduce API calls. Data is sorted chronologically before caching.
+    *   Media files are cached indefinitely in `data/media/`.
+    *   Improved interactive data purging options.
 
-✅ **Purge data:** Purge option to clear all directories just cache, media or output.
+✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input (including assisted Mastodon username entry), and displaying results. Progress indicators for data fetching and AI analysis.
 
-✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
+✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`) with improved error handling and exit codes. Respects `--no-auto-save` and `--format` arguments.
 
-✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`)
+✅ **Configurable Fetch Limits:** Uses defined constants (`INITIAL_FETCH_LIMIT`, `INCREMENTAL_FETCH_LIMIT`, `MASTODON_FETCH_LIMIT`) for fetching recent items per platform to balance depth and API usage.
 
-✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 30 tweets, 20 Reddit submissions, 30 Reddit comments, 50 HN items, ~300 Bluesky posts) to balance depth and API usage
+✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`. Log level configurable via `--log-level`.
 
-✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`
-
-✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file
+✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file.
 
 ```mermaid
 flowchart TD
@@ -55,17 +61,6 @@ flowchart TD
     D -->|Bluesky| E4([Bluesky]):::bskyClass
     D -->|Mastodon| E5([Mastodon]):::MastodonClass
     D -->|Cross-Platform| E6([Multiple Platforms]):::multiClass
-    D -->|Purge Data| P1([Select Purge Option]):::purgeClass
-
-    %% Purge Data Flow
-    P1 --> P2{Purge
-    Type?}:::decisionClass
-    P2 --> |All/Cache/Media/Outputs| P3{Confirm
-    Deletion?}:::decisionClass
-    P3 --> |Yes| P4([Delete Selected Data]):::purgeClass
-    P3 --> |No| C
-    P4 --> C
-    P2 --> |Cancel| C
 
     %% Stdin Mode Path
     B -->|Stdin| F([Parse JSON Input]):::inputClass
@@ -96,7 +91,7 @@ flowchart TD
         L --> L1{Rate
         Limited?}:::errorClass
         L1 -->|Yes| L2([Handle Rate Limit]):::errorClass
-        L2 --> L5([Abort or Retry]):::errorClass
+        L2 --> L5([Abort Fetch Attempt]):::errorClass
         L1 -->|No| L3([Extract Text & URLs]):::dataClass
         L3 --> L4([Save to Cache]):::apiClass
     end
@@ -140,8 +135,8 @@ flowchart TD
     WB --> |No| H
 
     %% Result display for each save option
+    %% Result display for each save option
     GA --> V1
-
     %% Custom Styling
     classDef defaultClass fill:#FFFFFF,stroke:#333,stroke-width:1px,color:#000
     classDef menuClass fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px,color:#000
@@ -159,7 +154,6 @@ flowchart TD
     classDef refreshClass fill:#80CBC4,stroke:#004D40,stroke-width:2px,color:#000
     classDef cacheClass fill:#B2EBF2,stroke:#006064,stroke-width:2px,color:#000
     classDef apiClass fill:#C5E1A5,stroke:#33691E,stroke-width:2px,color:#000
-    classDef purgeClass fill:#FFAB91,stroke:#D84315,stroke-width:2px,color:#000
     classDef errorClass fill:#E57373,stroke:#B71C1C,stroke-width:2px,color:#000
     classDef dataClass fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#000
     classDef textClass fill:#90CAF9,stroke:#1565C0,stroke-width:2px,color:#000
@@ -192,7 +186,17 @@ flowchart TD
     Create a `.env` file in the project root or export the following environment variables:
 
     ```sh
-    # --- Platform API Keys ---
+    # --- Core AI Analysis API ---
+    # OpenRouter (Get API Key from https://openrouter.ai)
+    export OPENROUTER_API_KEY='your_openrouter_api_key'
+
+    # --- AI Model Selection (OpenRouter Compatible) ---
+    # Model for text analysis (e.g., Mistral, Llama, Gemini models)
+    export ANALYSIS_MODEL='mistralai/mixtral-8x7b-instruct'
+    # Vision-capable model for image analysis
+    export IMAGE_ANALYSIS_MODEL='google/gemini-pro-vision' # Or e.g., openai/gpt-4-vision-preview
+
+    # --- Platform API Keys (Configure at least one platform or use Hacker News) ---
     # Twitter/X (Requires Elevated/Academic access for user tweet lookups)
     export TWITTER_BEARER_TOKEN='your_twitter_v2_bearer_token'
 
@@ -205,20 +209,9 @@ flowchart TD
     export BLUESKY_IDENTIFIER='your-handle.bsky.social' # Your full Bluesky handle
     export BLUESKY_APP_SECRET='xxxx-xxxx-xxxx-xxxx' # Your generated App Password
 
-    # Mastodon (Generate an App Password in Bluesky settings)
-    export MASTODON_API_BASE_URL='https://mastodon.example' # Your Mastodon server
-    export MASTODON_ACCESS_TOKEN='your_access_token'
-
-
-    # --- AI Analysis API ---
-    # OpenRouter (Get API Key from https://openrouter.ai)
-    export OPENROUTER_API_KEY='your_openrouter_api_key'
-
-    # --- AI Model Selection (OpenRouter Compatible) ---
-    # Model for text analysis
-    export ANALYSIS_MODEL='google/gemini-2.0-flash-001'
-    # Vision-capable model for image analysis
-    export IMAGE_ANALYSIS_MODEL='openai/gpt-4o-mini' # Must support vision
+    # Mastodon (Create an app in your Mastodon instance's Preferences -> Development)
+    export MASTODON_API_BASE_URL='https://mastodon.social' # Your Mastodon instance URL
+    export MASTODON_ACCESS_TOKEN='your_mastodon_access_token'
     ```
     *Note: The script automatically loads variables from a `.env` file if present.*
 
@@ -229,13 +222,13 @@ Run the script without arguments to start the interactive CLI session:
 ```bash
 python socialosintlm.py
 ```
-1.  You'll be prompted to select platform(s).
+1.  You'll be prompted to select platform(s) or `purge data`.
 2.  Enter the username(s) for each selected platform (comma-separated if multiple).
     *   **Twitter:** Usernames *without* the leading `@`.
     *   **Reddit:** Usernames *without* the leading `u/`.
     *   **Hacker News:** Usernames as they appear.
     *   **Bluesky:** Full handles including `.bsky.social` (or custom domain).
-    *   **Mastodon:** Full handles including `.mastodon.social` (or custom domain).
+    *   **Mastodon:** Full handles in `user@instance.domain` format. If the instance part is omitted and `MASTODON_API_BASE_URL` is set, the tool will offer to use that instance.
 3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "analyze recent activity patterns", "Identify key interests", "Assess communication style").
 4.  **Commands within the analysis loop:**
     *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data.
@@ -247,57 +240,67 @@ python socialosintlm.py
 Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing.
 
 ```bash
-        echo '{
-        "platforms": {
-        "twitter": ["user1", "user2"],
-        "reddit": ["user3"],
-        "hackernews": ["user4"],
-        "bluesky": ["handle1.bsky.social"],
-        "mastodon": ["user@instance.social", "another@other.server"]
-        },
-        "query": "Analyze communication style and main topics."
-        }' | python socialosintlm.py --stdin
+echo '{
+  "platforms": {
+    "twitter": ["user1", "user2"],
+    "reddit": ["user3"],
+    "hackernews": ["user4"],
+    "bluesky": ["handle1.bsky.social"],
+    "mastodon": ["user@instance.social", "another@other.server"]
+  },
+  "query": "Analyze communication style and main topics."
+}' | python socialosintlm.py --stdin
 ```
 
 ### Command-line Arguments
 *   `--stdin`: Read analysis configuration from standard input as a JSON object.
-*   `--format [json|markdown]`: Specifies the output format when saving results (default: `markdown`). Also affects output format in `--stdin` mode if not specified in the JSON.
+*   `--format [json|markdown]`: Specifies the output format when saving reports (default: `markdown`).
+    *   `markdown`: Saves as a `.md` file with YAML frontmatter.
+    *   `json`: Saves as a `.json` file containing metadata and the Markdown report content.
+*   `--no-auto-save`: Disables automatic saving of reports.
+    *   Interactive mode: Prompts the user before saving.
+    *   Stdin mode: Prints the report directly to stdout instead of saving.
+*   `--log-level [DEBUG|INFO|WARNING|ERROR|CRITICAL]`: Sets the logging level (default: `WARNING`).
 
 ## 📊 Output
-*   Analysis results are displayed in the console (in interactive mode).
-*   Results are automatically saved to the `data/outputs/` directory.
-*   Filename format: `analysis_YYYYMMDD_HHMMSS.[md|json]` (based on the `--format` argument or JSON input).
+*   Analysis results are displayed in the console with Rich formatting (in interactive mode).
+*   By default, results are automatically saved to the `data/outputs/` directory (unless `--no-auto-save` is used).
+*   Filename format: `analysis_YYYYMMDD_HHMMSS_{platforms}_{query_snippet}.[md|json]`.
+*   JSON output includes structured metadata and the full Markdown report.
 
 ## ⚡ Cache System
-*   **Text/API Data:** Fetched platform data is cached for **24 hours** in `data/cache/` as JSON files (`{platform}_{username}.json`). This minimizes redundant API calls.
-*   **Media Files:** Downloaded images and media are stored in `data/media/` using hashed filenames (`{platform}_{username}_{url_hash}.jpg`). These are not automatically purged by the 24-hour cache expiry but are reused if the same URL is encountered.
+*   **Text/API Data:** Fetched platform data is cached for **24 hours** in `data/cache/` as JSON files (`{platform}_{sanitized_username}.json`). This minimizes redundant API calls. Data is sorted chronologically before caching.
+*   **Media Files:** Downloaded images and media are stored in `data/media/` using content-hashed filenames (e.g., `{url_hash}.jpg`). These are reused if the same URL is encountered.
 *   Use the `refresh` command in interactive mode to force a bypass of the cache for the current session.
+*   Use the `purge data` option in the main menu for interactive removal of cached data.
 
 ## 🔍 Error Handling & Logging
-*   **Rate Limits:** Detects API rate limits. For Twitter, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally.
-*   **API Errors:** Handles common platform-specific errors (e.g., user not found (`tweepy.NotFound`), forbidden access (`tweepy.Forbidden`), general request issues (`prawcore.exceptions.RequestException`, `exceptions.AtProtocolError`)).
-*   **Media Download Errors:** Logs issues during media download or processing.
-*   **Logging:** Detailed errors and warnings are logged to `analyzer.log` for debugging.
+*   **Rate Limits:** Detects API rate limits. For Twitter, it attempts to display the reset time. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally and handled.
+*   **API Errors:** Handles common platform-specific errors (e.g., user not found, forbidden access, general request issues) with clear logging and user feedback.
+*   **Media Download/Processing Errors:** Logs issues during media download, processing, or analysis.
+*   **Logging:** Detailed errors and warnings are logged to `analyzer.log`. The log level can be set via the `--log-level` argument.
+*   **STDIN Mode Exit Codes:** `0` for success, `1` for input/setup errors, `2` for errors during the analysis phase.
 
 ## 🤖 AI Analysis Details
 *   **Text Analysis:**
     *   Uses the model specified by `ANALYSIS_MODEL`.
-    *   Receives **formatted summaries** of fetched data (user info, stats, recent post/comment text snippets, media presence indicators) per platform, *not* raw API dumps.
-    *   Guided by a detailed **system prompt** focusing on objective, evidence-based analysis across domains: Behavioral Patterns, Semantic Content, Interests/Network, Communication Style.
+    *   Receives **formatted summaries** of fetched data (user info, stats, recent post/comment text snippets, media presence indicators, platform-specific details like Mastodon visibility/CWs or Bluesky languages) per platform.
+    *   Guided by a detailed **system prompt** focusing on objective, evidence-based analysis across domains: Behavioral Patterns, Semantic Content, Interests/Network, Communication Style, Visual Data Integration.
 *   **Image Analysis:**
     *   Uses the vision-capable model specified by `IMAGE_ANALYSIS_MODEL`.
-    *   Images larger than 1024x1024 are resized before analysis to conserve tokens and meet potential API limits.
+    *   Images are preprocessed: animated GIFs use the first frame, various modes converted to RGB, and images resized if max dimension exceeds **1536px**.
     *   Guided by a specific **prompt** requesting objective identification of key OSINT-relevant elements (setting, objects, people details, text, activity, overall theme). Avoids speculation.
-*   **Integration:** The final text analysis incorporates insights derived from both the formatted text data summaries and the individual image analysis reports.
+*   **Integration:** The final text analysis incorporates insights derived from both the formatted text data summaries and the individual image analysis reports (if available).
 
 ## 📸 Media Processing Details
-*   Downloads media files (currently focused on images: `JPEG, PNG, GIF, WEBP`) linked in posts/tweets.
-*   Stores files locally in `data/media/`.
+*   Downloads media files (images: `JPEG, PNG, GIF, WEBP`; also handles video/audio types by downloading, though analysis is image-focused) linked in posts/tweets.
+*   Stores files locally in `data/media/` with content-hashed names.
 *   Handles platform-specific access:
-    *   Twitter: Uses Bearer Token for potential private media access (though typically public URLs).
+    *   Twitter: May use Bearer Token for media URLs.
     *   Bluesky: Constructs authenticated CDN URLs (`cdn.bsky.app`) using the user's DID, image CID, and the session's access token.
     *   Reddit: Handles direct image links and images within Reddit Galleries (`media_metadata`).
-*   analyzes valid downloaded images using the vision LLM.
+    *   Mastodon: Media usually public CDN, but downloads standard attachments.
+*   Analyzes valid downloaded images using the vision LLM.
 
 ## 🔒 Security Considerations
 *   **API Keys:** Requires potentially sensitive API keys and secrets stored as environment variables or in a `.env` file. Ensure this file is secured and added to `.gitignore`.
