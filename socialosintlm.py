@@ -5,7 +5,7 @@ import hashlib
 import logging
 import argparse
 import threading
-import httpx
+import httpx # Still used for media downloads and some platform fetches (e.g. HackerNews)
 import tweepy
 import praw
 import prawcore
@@ -32,8 +32,12 @@ from atproto import Client, exceptions as atproto_exceptions
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, cast, Mapping # Added cast, Mapping
 from functools import lru_cache
+
+# OpenAI library imports
+from openai import OpenAI, APIError, RateLimitError, AuthenticationError, BadRequestError, OpenAIError
+from openai.types.chat import ChatCompletion # For type hinting completion object
 
 load_dotenv()  # Load .env file if available
 
@@ -45,35 +49,39 @@ logging.basicConfig(
 logger = logging.getLogger("SocialOSINTLM")
 
 # Constants
-CACHE_EXPIRY_HOURS = 24
-MAX_CACHE_ITEMS = 200  # Max tweets/posts/submissions per user/platform in cache
-REQUEST_TIMEOUT = 20.0  # Default timeout for HTTP requests
-INITIAL_FETCH_LIMIT = 50  # How many items to fetch on first run or force_refresh
-INCREMENTAL_FETCH_LIMIT = 50  # How many items to fetch during incremental updates
-MASTODON_FETCH_LIMIT = 40  # Mastodon API max is often 40
+CACHE_EXPIRY_HOURS = 24 # How long cache files are considered 'fresh'
+MAX_CACHE_ITEMS = 200 # Max tweets/posts/submissions per user/platform in cache
+REQUEST_TIMEOUT = 20.0 # Default timeout for HTTP requests
+INITIAL_FETCH_LIMIT = 50 # How many items to fetch on first run or force_refresh
+INCREMENTAL_FETCH_LIMIT = 50 # How many items to fetch during incremental updates
+MASTODON_FETCH_LIMIT = 40 # Mastodon API max limit is often 40
 SUPPORTED_IMAGE_EXTENSIONS = [
     ".jpg",
     ".jpeg",
     ".png",
     ".webp",
     ".gif",
-]  # Consolidated list
+] # Consolidated list for media analysis
 
 
-class RateLimitExceededError(Exception):
+class RateLimitExceededError(Exception): # Renamed for clarity if used internally
+    """Custom exception for API rate limits."""
     pass
 
 
 class UserNotFoundError(Exception):
+    """Custom exception for when a user/profile cannot be found."""
     pass
 
 
 class AccessForbiddenError(Exception):
+    """Custom exception for access denied (e.g., private account)."""
     pass
 
 
 # JSON Encoder
 class DateTimeEncoder(json.JSONEncoder):
+    """JSON encoder to handle datetime objects."""
     def default(self, obj):
         if isinstance(obj, datetime):
             return obj.isoformat()
@@ -82,7 +90,7 @@ class DateTimeEncoder(json.JSONEncoder):
 
 # Helper Function (Moved to Global Scope)
 def get_sort_key(item: Dict[str, Any], dt_key: str) -> datetime:
-    """Safely gets and parses a datetime string or object for sorting."""
+    """Safely gets and parses a datetime string or object/timestamp for sorting."""
     dt_val = item.get(dt_key)
     if isinstance(dt_val, str):
         try:
@@ -94,7 +102,7 @@ def get_sort_key(item: Dict[str, Any], dt_key: str) -> datetime:
             return dt_obj if dt_obj.tzinfo else dt_obj.replace(tzinfo=timezone.utc)
         except ValueError:  # Handle cases where conversion might fail
             logger.warning(f"Could not parse datetime string: {dt_val}")
-            return datetime.min.replace(tzinfo=timezone.utc)
+            return datetime.min.replace(tzinfo=timezone.utc) # Fallback to minimum time
     elif isinstance(dt_val, datetime):
         # Ensure timezone for comparison if needed (make it UTC if naive)
         return dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
@@ -118,6 +126,9 @@ def get_sort_key(item: Dict[str, Any], dt_key: str) -> datetime:
 
 # Main Class
 class SocialOSINTLM:
+    _llm_completion_object: Optional[ChatCompletion] = None
+    _llm_api_exception: Optional[Exception] = None
+
     def __init__(self, args=None):
         self.console = Console()
         self.base_dir = Path("data")
@@ -125,13 +136,19 @@ class SocialOSINTLM:
         # self.progress is no longer a shared instance variable for all progress bars.
         # It will be instantiated locally where needed.
         self.current_task: Optional[TaskID] = None # This might become obsolete or used differently
-        self._analysis_response: Optional[httpx.Response] = None
-        self._analysis_exception: Optional[Exception] = None
         self.args = args if args else argparse.Namespace()
-        self._verify_env_vars()
+        self._verify_env_vars() # This will now check LLM vars too
 
     def _verify_env_vars(self):
-        required = ["OPENROUTER_API_KEY", "IMAGE_ANALYSIS_MODEL"]
+        # Core LLM settings
+        required_llm = ["LLM_API_KEY", "LLM_API_BASE_URL", "IMAGE_ANALYSIS_MODEL", "ANALYSIS_MODEL"]
+        missing_llm = [var for var in required_llm if not os.getenv(var)]
+        if missing_llm:
+            raise RuntimeError(
+                f"Missing critical LLM-related environment variables: {', '.join(missing_llm)}. "
+                "Please set LLM_API_KEY, LLM_API_BASE_URL, IMAGE_ANALYSIS_MODEL, and ANALYSIS_MODEL."
+            )
+
         # Check for at least one platform credential set
         platforms_configured = any(
             [
@@ -156,17 +173,13 @@ class SocialOSINTLM:
         if not platforms_configured and "hackernews" not in available_no_creds:
             logger.warning(
                 "No platform API credentials found in environment variables. Only HackerNews might work."
+                " Please set credentials for at least one platform or note that only HackerNews will function."
             )
         elif not platforms_configured and "hackernews" in available_no_creds:
-            pass  # HackerNews alone is okay
-
-        missing_core = [var for var in required if not os.getenv(var)]
-        if missing_core:
-            raise RuntimeError(
-                f"Missing critical environment variables: {', '.join(missing_core)}"
-            )
+            pass # HackerNews alone is okay if no other platforms are configured
 
     def _setup_directories(self):
+        """Ensures necessary directories exist."""
         for dir_name in ["cache", "media", "outputs"]:
             (self.base_dir / dir_name).mkdir(parents=True, exist_ok=True)
 
@@ -199,7 +212,7 @@ class SocialOSINTLM:
 
         selected_name, dirs_to_purge = purge_options[choice]
 
-        if not dirs_to_purge:  # Handle Cancel choice
+        if not dirs_to_purge: # Handle Cancel choice
             self.console.print("[cyan]Purge operation cancelled.[/cyan]")
             return
 
@@ -215,7 +228,7 @@ class SocialOSINTLM:
                     if dir_path.exists():
                         shutil.rmtree(dir_path)
                         logger.info(f"Successfully purged directory: {dir_path}")
-                        dir_path.mkdir(parents=True, exist_ok=True)
+                        dir_path.mkdir(parents=True, exist_ok=True) # Recreate after purge
                         self.console.print(
                             f"[green]Successfully purged '{dir_path.name}'.[/green]"
                         )
@@ -224,7 +237,7 @@ class SocialOSINTLM:
                         self.console.print(
                             f"[yellow]Directory '{dir_path.name}' does not exist, skipping.[/yellow]"
                         )
-                        dir_path.mkdir(parents=True, exist_ok=True)
+                        dir_path.mkdir(parents=True, exist_ok=True) # Ensure it exists for future use
                         success_count += (
                             1
                         )
@@ -260,8 +273,49 @@ class SocialOSINTLM:
             self.console.print("[cyan]Purge operation cancelled.[/cyan]")
         self.console.print("")
 
+
+    @property
+    def llm_client(self) -> OpenAI:
+        """Initializes and returns the OpenAI client for LLM calls."""
+        if not hasattr(self, "_llm_client_instance"):
+            try:
+                api_key = os.environ.get("LLM_API_KEY")
+                base_url = os.environ.get("LLM_API_BASE_URL")
+
+                if not api_key:
+                    raise ValueError(
+                        "LLM_API_KEY not found in environment variables. This is required."
+                    )
+                if not base_url:
+                    raise ValueError(
+                        "LLM_API_BASE_URL not found in environment variables. This is required (e.g., https://openrouter.ai/api/v1 or http://localhost:8000/v1)."
+                    )
+
+                current_default_headers: Dict[str, str] = {}
+                # Conditionally add OpenRouter specific headers if configured
+                if "openrouter.ai" in base_url.lower():
+                    referer = os.getenv("OPENROUTER_REFERER", "http://localhost:3000") # Default if not set
+                    x_title = os.getenv("OPENROUTER_X_TITLE", "SocialOSINTLM") # Default if not set
+                    current_default_headers["HTTP-Referer"] = referer
+                    current_default_headers["X-Title"] = x_title
+                    # Content-Type is handled by the openai library
+
+                self._llm_client_instance = OpenAI(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=httpx.Timeout(60.0, connect=10.0), # Standard timeout object
+                    default_headers=current_default_headers if current_default_headers else None,
+                )
+                logger.info(f"LLM client initialized for base URL: {base_url}")
+            except ValueError as e: # For missing env vars
+                raise RuntimeError(f"LLM client configuration error: {e}")
+            except Exception as e: # Catch-all for other init errors
+                raise RuntimeError(f"Failed to initialize LLM client: {e}")
+        return self._llm_client_instance
+
     @property
     def bluesky(self) -> Client:
+        """Initializes and returns the Bluesky client."""
         if not hasattr(self, "_bluesky_client"):
             try:
                 if not os.getenv("BLUESKY_IDENTIFIER") or not os.getenv(
@@ -272,6 +326,7 @@ class SocialOSINTLM:
                     )
                 client = Client()
                 try:
+                    # Login to get session token needed for some operations like media download
                     login_response = client.login(
                         os.environ["BLUESKY_IDENTIFIER"],
                         os.environ["BLUESKY_APP_SECRET"],
@@ -294,11 +349,12 @@ class SocialOSINTLM:
                 logger.error(f"Bluesky setup failed: {e}")
                 raise RuntimeError(
                     f"Bluesky setup failed: {e}"
-                )
+                ) # Re-raise as RuntimeError for caller to handle
         return self._bluesky_client
 
     @property
     def mastodon(self) -> Mastodon:
+        """Initializes and returns the Mastodon client."""
         if not hasattr(self, "_mastodon_client"):
             try:
                 token = os.getenv("MASTODON_ACCESS_TOKEN")
@@ -320,6 +376,7 @@ class SocialOSINTLM:
                     request_timeout=REQUEST_TIMEOUT,
                 )
                 try:
+                    # Test connection and token validity
                     instance_info = client.instance()
                     instance_title = instance_info.get("title", "N/A")
                     instance_uri = instance_info.get("uri", "URI Missing")
@@ -351,38 +408,12 @@ class SocialOSINTLM:
                 logger.debug(f"Mastodon client initialized for {base_url}.")
             except (KeyError, RuntimeError) as e:
                 logger.error(f"Mastodon setup failed: {e}")
-                raise RuntimeError(f"Mastodon setup failed: {e}")
+                raise RuntimeError(f"Mastodon setup failed: {e}") # Re-raise as RuntimeError
         return self._mastodon_client
 
     @property
-    def openrouter(self) -> httpx.Client:
-        if not hasattr(self, "_openrouter"):
-            try:
-                api_key = os.environ.get("OPENROUTER_API_KEY")
-                if not api_key:
-                    raise KeyError(
-                        "OPENROUTER_API_KEY not found in environment variables. Check your .env file."
-                    )
-                self._openrouter = httpx.Client(
-                    base_url="https://openrouter.ai/api/v1",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "HTTP-Referer": "http://localhost:3000",
-                        "X-Title": "Social Media analyzer",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=60.0,
-                )
-            except KeyError as e:
-                raise RuntimeError(
-                    f"Missing OpenRouter API key (OPENROUTER_API_KEY): {e}"
-                )
-            except Exception as e:
-                raise RuntimeError(f"Failed to initialize OpenRouter client: {e}")
-        return self._openrouter
-
-    @property
     def reddit(self) -> praw.Reddit:
+        """Initializes and returns the Reddit client (PRAW)."""
         if not hasattr(self, "_reddit"):
             try:
                 if not all(
@@ -400,13 +431,14 @@ class SocialOSINTLM:
                     client_id=os.environ["REDDIT_CLIENT_ID"],
                     client_secret=os.environ["REDDIT_CLIENT_SECRET"],
                     user_agent=os.environ["REDDIT_USER_AGENT"],
-                    read_only=True,
+                    read_only=True, # We only need read access
                 )
                 is_read_only = self._reddit.read_only
                 logger.debug(f"Reddit client initialized (Read-Only: {is_read_only}).")
                 if (
                     not is_read_only and self._reddit.user.me() is None
-                ): # pragma: no cover
+                ): # pragma: no cover (depends on live API)
+                    # This check requires non-read-only, but logging it anyway
                     logger.warning(
                         "Reddit client may not be properly authenticated even though no error was raised."
                     )
@@ -433,6 +465,7 @@ class SocialOSINTLM:
 
     @property
     def twitter(self) -> tweepy.Client:
+        """Initializes and returns the Twitter client (tweepy)."""
         if not hasattr(self, "_twitter"):
             try:
                 token = os.getenv("TWITTER_BEARER_TOKEN")
@@ -444,6 +477,7 @@ class SocialOSINTLM:
                     bearer_token=token, wait_on_rate_limit=False
                 )
                 # Test connection by fetching a known, public user
+                # This raises Unauthorized or TweepyException if token is bad or API down
                 self._twitter.get_user(
                     username="twitterdev", user_fields=["id"]
                 ) # pragma: no cover (depends on live API)
@@ -463,51 +497,37 @@ class SocialOSINTLM:
                 raise RuntimeError(f"Twitter client initialization failed: {e}")
         return self._twitter
 
-    def _handle_rate_limit(self, platform: str, exception: Optional[Exception] = None):
-        error_message = f"{platform} API rate limit exceeded."
+    def _handle_rate_limit(self, platform_context: str, exception: Optional[Exception] = None):
+        """Handles rate limit exceptions by logging and raising a standard error."""
+        error_message = f"{platform_context} API rate limit exceeded."
         reset_info = ""
-        wait_seconds = 900 # Default 15 minutes
+        wait_seconds = 900  # Default 15 minutes
 
-        if isinstance(exception, tweepy.TooManyRequests):
+        if isinstance(exception, tweepy.TooManyRequests): # pragma: no cover
             rate_limit_reset = exception.response.headers.get("x-rate-limit-reset")
             if rate_limit_reset:
                 try:
                     reset_timestamp = int(rate_limit_reset)
-                    reset_time = datetime.fromtimestamp(
-                        reset_timestamp, tz=timezone.utc
-                    )
+                    reset_time = datetime.fromtimestamp(reset_timestamp, tz=timezone.utc)
                     current_time = datetime.now(timezone.utc)
-                    wait_seconds = max(
-                        int((reset_time - current_time).total_seconds()) + 5, 1
-                    ) # Add 5s buffer
+                    wait_seconds = max(int((reset_time - current_time).total_seconds()) + 5, 1) # Add 5s buffer
                     reset_info = f"Try again after: {reset_time.strftime('%Y-%m-%d %H:%M:%S UTC')} ({wait_seconds}s)"
-                except (ValueError, TypeError): # pragma: no cover
-                    logger.warning(
-                        "Could not parse Twitter rate limit reset time header."
-                    )
+                except (ValueError, TypeError):
+                    logger.warning("Could not parse Twitter rate limit reset time header.")
                     reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
-            else: # pragma: no cover
+            else:
                 reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying (reset header missing)."
-
-        elif (
-            isinstance(
-                exception, (prawcore.exceptions.RequestException, httpx.HTTPStatusError)
-            )
-            and hasattr(exception, "response")
-            and exception.response is not None
-            and exception.response.status_code == 429
-        ):
-            # Reddit uses 'x-ratelimit-reset' (seconds until reset) or 'Retry-After' (seconds to wait)
-            retry_after = exception.response.headers.get("Retry-After") # More common
-            if not retry_after: retry_after = exception.response.headers.get("x-ratelimit-reset") # PRAW specific?
-
+        elif (isinstance(exception, (prawcore.exceptions.RequestException, httpx.HTTPStatusError))
+              and hasattr(exception, "response") and exception.response is not None
+              and exception.response.status_code == 429): # pragma: no cover
+            # Reddit and general HTTP 429 may use Retry-After or x-ratelimit-reset
+            retry_after = exception.response.headers.get("Retry-After") or exception.response.headers.get("x-ratelimit-reset")
             if retry_after and retry_after.isdigit():
-                wait_seconds = int(retry_after) + 5 # Add 5s buffer
+                wait_seconds = int(retry_after) + 5
                 reset_info = f"Try again in {wait_seconds} seconds."
-            else: # pragma: no cover
+            else:
                 reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
-        elif isinstance(exception, MastodonRatelimitError): # pragma: no cover (hard to trigger reliably in tests)
-            # Mastodon usually includes X-RateLimit-Reset in ISO 8601 date format
+        elif isinstance(exception, MastodonRatelimitError): # pragma: no cover
             reset_header = getattr(exception, "headers", {}).get("X-RateLimit-Reset")
             if reset_header:
                 try:
@@ -520,60 +540,87 @@ class SocialOSINTLM:
                     reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
             else:
                 reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
-        elif (
-            isinstance(exception, atproto_exceptions.AtProtocolError)
-            and "rate limit" in str(exception).lower()
-        ): # pragma: no cover (hard to trigger)
+        elif isinstance(exception, RateLimitError): # Handles LLM rate limits (from openai library)
+            error_message = f"LLM API ({platform_context}) rate limit exceeded."
+            wait_seconds = 60 # Default 1 min for LLM if no specific header
+            reset_info = f"Wait ~{wait_seconds // 60} minute(s) before retrying."
+            
+            # OpenAI library's RateLimitError might have response details
+            if hasattr(exception, 'response') and exception.response:
+                headers = exception.response.headers
+                # Standard 'Retry-After' header (seconds or HTTP-date)
+                retry_after_header = headers.get("retry-after") or headers.get("Retry-After")
+                # OpenRouter specific rate limit headers (if LLM_API_BASE_URL points there)
+                openrouter_reset_s = headers.get("x-ratelimit-reset") # float seconds until reset
+                openrouter_retry_after_ms = headers.get("x-ratelimit-retry-after-ms") # int ms to wait
+
+                if openrouter_retry_after_ms and openrouter_retry_after_ms.isdigit():
+                    wait_seconds = (int(openrouter_retry_after_ms) // 1000) + 2 # ms to s, +2s buffer
+                    reset_info = f"Try again in {wait_seconds} seconds (from x-ratelimit-retry-after-ms)."
+                elif openrouter_reset_s:
+                    try:
+                        current_time_s = datetime.now(timezone.utc).timestamp()
+                        reset_timestamp_s = float(openrouter_reset_s)
+                        wait_seconds = max(int(reset_timestamp_s - current_time_s) + 5, 1) # +5s buffer
+                        reset_time_dt = datetime.fromtimestamp(reset_timestamp_s, tz=timezone.utc)
+                        reset_info = f"Try again after: {reset_time_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({wait_seconds}s from x-ratelimit-reset)."
+                    except (ValueError, TypeError):
+                        logger.warning(f"Could not parse OpenRouter x-ratelimit-reset: {openrouter_reset_s}")
+                elif retry_after_header:
+                    if retry_after_header.isdigit():
+                        wait_seconds = int(retry_after_header) + 5
+                        reset_info = f"Try again in {wait_seconds} seconds (from Retry-After header)."
+                    else: # HTTP-date format
+                        try:
+                            reset_time_dt = datetime.strptime(retry_after_header, '%a, %d %b %Y %H:%M:%S GMT').replace(tzinfo=timezone.utc)
+                            current_time = datetime.now(timezone.utc)
+                            wait_seconds = max(int((reset_time_dt - current_time).total_seconds()) + 5, 1)
+                            reset_info = f"Try again after: {reset_time_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({wait_seconds}s from Retry-After date)."
+                        except ValueError:
+                            logger.warning(f"Could not parse LLM rate limit Retry-After date header: {retry_after_header}")
+            else: # Fallback if no response details on the exception object
+                logger.debug("OpenAI RateLimitError did not have detailed response headers for retry timing.")
+        elif (isinstance(exception, atproto_exceptions.AtProtocolError) and "rate limit" in str(exception).lower()): # pragma: no cover (hard to trigger)
             reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
-            # Bluesky's RateLimitExceededError might have more details in `response.content`
             try:
                 if hasattr(exception, "response") and exception.response:
                     err_data = json.loads(exception.response.content)
-                    if err_data.get("error") == "RateLimitExceeded":
-                        # Potentially parse `err_data['message']` for reset time if available
-                        pass # No standard reset header known yet
-            except (json.JSONDecodeError, AttributeError): # pragma: no cover
-                pass # Stick to default
-        else: # pragma: no cover
-            # For other httpx 429s, like from OpenRouter/Image analysis
-            if (
-                isinstance(exception, httpx.HTTPStatusError)
-                and exception.response.status_code == 429
-            ):
+                    if err_data.get("error") == "RateLimitExceeded": pass # Bluesky specific check
+            except (json.JSONDecodeError, AttributeError): pass # Stick to default
+        else: # For other httpx 429s (e.g., media download)
+            if (isinstance(exception, httpx.HTTPStatusError) and exception.response.status_code == 429):
                 retry_after_header = exception.response.headers.get("Retry-After")
                 if retry_after_header and retry_after_header.isdigit():
                     wait_seconds = int(retry_after_header) + 5
                     reset_info = f"Try again in {wait_seconds} seconds."
                 else:
                     reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
-                error_message = f"Image Analysis ({platform}) API rate limit exceeded."
+                error_message = f"Media Download or other HTTP ({platform_context}) API rate limit exceeded."
             else:
                 reset_info = f"Wait ~{wait_seconds // 60} minutes before retrying."
 
         self.console.print(
             Panel(
-                f"[bold red]Rate Limit Blocked: {platform}[/bold red]\n"
+                f"[bold red]Rate Limit Blocked: {platform_context}[/bold red]\n"
                 f"{error_message}\n"
                 f"{reset_info}",
                 title="🚫 Rate Limit",
                 border_style="red",
             )
         )
-        raise RateLimitExceededError(
-            error_message + f" ({reset_info})"
-        ) # Reraise for upstream handling
+        raise RateLimitExceededError(error_message + f" ({reset_info})") # Reraise for upstream handling
 
     def _get_media_path(self, url: str, platform: str, username: str) -> Path:
+        """Generates a consistent local path for downloaded media."""
         # Username is not strictly needed here for hash, but kept for consistency
         # Using only URL hash for broader caching if same media is on different user profiles
         url_hash = hashlib.md5(url.encode()).hexdigest()
         return (
             self.base_dir / "media" / f"{url_hash}.media"
-        )  # Stub, extension added after download
+        ) # Stub, extension added after download
 
-    def _download_media(
-        self, url: str, platform: str, username: str, headers: Optional[dict] = None
-    ) -> Optional[Path]: # pragma: no cover
+    def _download_media(self, url: str, platform: str, username: str, headers: Optional[dict] = None) -> Optional[Path]: # pragma: no cover
+        """Downloads a media file from a URL and caches it."""
         media_path_stub = self._get_media_path(url, platform, username)
 
         # Check if file with any valid extension exists
@@ -620,7 +667,7 @@ class SocialOSINTLM:
                     # Accessing the session token might be internal to atproto Client.
                     # For bsky.app/cdn.bsky.app, auth is sometimes needed.
                     # This is a simplified attempt; true auth might require more.
-                    access_token = getattr(self.bluesky._session, "access_jwt", None)
+                    access_token = getattr(self.bluesky._session, "access_jwt", None) # type: ignore
                     if not access_token:
                         # Try to refresh/ensure login if token is missing?
                         # For now, just log a warning if it's not immediately available.
@@ -644,8 +691,8 @@ class SocialOSINTLM:
 
             if not extension:
                 # Try to guess from URL if content-type is generic (e.g. application/octet-stream)
-                parsed_url = urlparse(url)
-                path_ext = Path(parsed_url.path).suffix.lower()
+                parsed_url_path = urlparse(url).path # Changed variable name
+                path_ext = Path(parsed_url_path).suffix.lower()
                 if path_ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm"]:
                     extension = path_ext
                     logger.debug(f"Guessed extension '{extension}' from URL for content type '{content_type}'.")
@@ -676,8 +723,9 @@ class SocialOSINTLM:
             # Log minimally to avoid huge logs for common errors like bad certs on obscure instances
             logger.error(f"Media download failed unexpectedly for {url}: {str(e)}", exc_info=False)
             return None
-
+  
     def _analyze_image(self, file_path: Path, context: str = "") -> Optional[str]: # pragma: no cover
+        """Analyzes an image file using a vision-capable LLM."""
         if not file_path or not file_path.exists():
             logger.warning(f"Image analysis skipped: file path invalid or missing ({file_path})")
             return None
@@ -741,7 +789,7 @@ class SocialOSINTLM:
                 if needs_conversion: # If any change was made or format isn't JPEG
                     temp_suffix = f".processed.{target_format.lower()}"
                     temp_path = file_path.with_suffix(temp_suffix)
-                    img_to_process.save(temp_path, target_format, quality=85) # Save as JPEG
+                    img_to_process.save(temp_path, target_format, quality=85) # Save as JPEG with reasonable quality
                     analysis_file_path = temp_path # Use this processed file for analysis
                     logger.debug(f"Saved processed image for analysis: {analysis_file_path}")
                 else: # Original is fine
@@ -765,58 +813,49 @@ class SocialOSINTLM:
                 "Output a concise, bulleted list of observations. Avoid assumptions, interpretations, or emotional language not directly supported by the visual evidence."
             )
             model_to_use = os.getenv("IMAGE_ANALYSIS_MODEL")
+            if not model_to_use:
+                logger.error("IMAGE_ANALYSIS_MODEL environment variable not set. Cannot analyze image.")
+                return None
 
-            response = self.openrouter.post(
-                "/chat/completions",
-                json={
-                    "model": model_to_use,
-                    "messages": [
-                        {"role": "user", "content": [
-                            {"type": "text", "text": prompt_text},
-                            {"type": "image_url", "image_url": {"url": image_data_url, "detail": "high"}}, # Use high detail
-                        ]}
-                    ],
-                    "max_tokens": 1024, # Adjust as needed
-                },
+            logger.debug(f"Sending image analysis request for {file_path} to model {model_to_use} via {self.llm_client.base_url}") # type: ignore
+            
+            # Use the OpenAI client
+            completion = self.llm_client.chat.completions.create(
+                model=model_to_use,
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt_text},
+                        {"type": "image_url", "image_url": {"url": image_data_url, "detail": "high"}},
+                    ]}
+                ],
+                max_tokens=1024, # Reasonable token limit for description
             )
-            response.raise_for_status() # Check for HTTP errors
-            result = response.json()
-
-            if "error" in result: # Check for API-level errors in JSON response
-                err_msg = result["error"].get("message", "Unknown error detail")
-                err_code = result["error"].get("code", "N/A")
-                logger.error(f"Image analysis API error (Code: {err_code}) for {file_path}: {err_msg}")
-                return None
-            if not result.get("choices") or not result["choices"][0].get("message") or not result["choices"][0]["message"].get("content"):
-                logger.error(f"Invalid image analysis API response structure for {file_path}: {result}")
+            if not completion.choices or not completion.choices[0].message or not completion.choices[0].message.content:
+                logger.error(f"Invalid image analysis API response structure for {file_path}: {completion.model_dump_json(indent=2)}")
                 return None
 
-            analysis_text = result["choices"][0]["message"]["content"]
+            analysis_text = completion.choices[0].message.content
             logger.debug(f"Image analysis successful for: {file_path}")
             return analysis_text.strip()
 
         except (IOError, Image.DecompressionBombError, SyntaxError, ValueError) as img_err: # PIL errors
             logger.error(f"Image processing error for {file_path}: {str(img_err)}")
             return None
-        except httpx.RequestError as req_err: # Network errors for API call
-            logger.error(f"Network error during image analysis API call for {file_path}: {str(req_err)}")
-            return None
-        except httpx.HTTPStatusError as status_err: # HTTP errors from API call
-            model_to_use = os.getenv("IMAGE_ANALYSIS_MODEL") # For logging
-            response_text = status_err.response.text[:500] # Log part of response
-            if status_err.response.status_code == 429:
-                self._handle_rate_limit(model_to_use, status_err) # Pass model name as platform
-            elif status_err.response.status_code == 401: # Unauthorized
-                logger.error(f"HTTP 401 Unauthorized during image analysis ({model_to_use}). Check your OPENROUTER_API_KEY.")
-                logger.error(f"API Response Snippet: {response_text}")
-                return None
-            elif status_err.response.status_code == 400: # Bad Request (e.g., invalid image data, unsupported format by API)
-                logger.error(f"HTTP 400 Bad Request during image analysis ({model_to_use}). Often due to invalid input. Check image and API docs.")
-                logger.error(f"API Response Snippet: {response_text}")
-                return None
-            else:
-                logger.error(f"HTTP error {status_err.response.status_code} during image analysis ({model_to_use}): {response_text}")
-            return None
+        except APIError as api_err: # Generic OpenAI API error
+            model_used = os.getenv("IMAGE_ANALYSIS_MODEL", "Unknown Model")
+            err_message = str(api_err)
+            status_code = api_err.status_code if hasattr(api_err, 'status_code') else "N/A"
+            logger.error(f"LLM API error during image analysis ({model_used}). Status: {status_code}. Error: {err_message}")
+            if hasattr(api_err, 'response') and api_err.response and hasattr(api_err.response, 'text'):
+                logger.error(f"API Response Snippet: {api_err.response.text[:500]}")
+
+            if isinstance(api_err, RateLimitError):
+                self._handle_rate_limit(f"LLM Image Analysis ({model_used})", api_err) # This will re-raise
+            elif isinstance(api_err, AuthenticationError):
+                logger.error(f"LLM API Authentication Error (401) for model {model_used}. Check your LLM_API_KEY.")
+            elif isinstance(api_err, BadRequestError):
+                logger.error(f"LLM API Bad Request (400) for model {model_used}. Often due to invalid input.")
+            return None # For other API errors, just log and return None
         except Exception as e:
             logger.error(f"Unexpected error during image analysis for {file_path}: {str(e)}", exc_info=True)
             return None
@@ -828,15 +867,16 @@ class SocialOSINTLM:
                 except OSError as e: # pragma: no cover
                     logger.warning(f"Could not delete temporary analysis file {temp_path}: {e}")
 
-
     @lru_cache(maxsize=128) # Cache path generation
     def _get_cache_path(self, platform: str, username: str) -> Path:
+        """Generates a consistent local path for cache files."""
         # Sanitize username for filesystem, allowing common chars like @ . - _
         safe_username = "".join(c if c.isalnum() or c in ["-", "_", ".", "@"] else "_" for c in username)
         safe_username = safe_username[:100] # Limit length
         return self.base_dir / "cache" / f"{platform}_{safe_username}.json"
 
     def _load_cache(self, platform: str, username: str) -> Optional[Dict[str, Any]]:
+        """Loads data from a user's cache file if fresh."""
         cache_path = self._get_cache_path(platform, username)
         if not cache_path.exists():
             logger.debug(f"Cache miss (file not found): {cache_path}")
@@ -886,7 +926,7 @@ class SocialOSINTLM:
                 if not missing_keys:
                     logger.info(f"Cache hit and valid for {platform}/{username}")
                      # Ensure hackernews 'items' key if 'submissions' was used from old cache
-                    if platform == "hackernews" and "submissions" in data and "items" not in data:
+                    if platform == "hackernews" and "submissions" in data and "items" not in data: # pragma: no cover
                         data["items"] = data.pop("submissions")
                     return data
                 else: # pragma: no cover
@@ -896,7 +936,7 @@ class SocialOSINTLM:
             else:
                 logger.info(f"Cache expired for {platform}/{username}. Returning stale data for incremental baseline.")
                 # Ensure hackernews 'items' key if 'submissions' was used from old cache
-                if platform == "hackernews" and "submissions" in data and "items" not in data:
+                if platform == "hackernews" and "submissions" in data and "items" not in data: # pragma: no cover
                     data["items"] = data.pop("submissions")
                 return data # Return stale data for incremental fetches
         except (json.JSONDecodeError, KeyError, FileNotFoundError) as e: # FileNotFoundError for unlink race condition
@@ -909,6 +949,7 @@ class SocialOSINTLM:
             return None
 
     def _save_cache(self, platform: str, username: str, data: Dict[str, Any]):
+        """Saves data to a user's cache file."""
         cache_path = self._get_cache_path(platform, username)
         try:
             # Ensure items are sorted chronologically before saving (newest first)
@@ -924,11 +965,9 @@ class SocialOSINTLM:
                     if list_key in data and isinstance(data[list_key], list) and data[list_key]:
                         # Filter out items that might be missing the sort key (though unlikely for primary data)
                         items_to_sort = [item for item in data[list_key] if dt_key in item]
-                        items_to_sort.sort(key=lambda x: get_sort_key(x, dt_key), reverse=True)
-                        # Replace the original list with the sorted one
+                        # Sort the original list in place
                         data[list_key].sort(key=lambda x: get_sort_key(x, dt_key), reverse=True)
                         logger.debug(f"Sorted '{list_key}' for {platform}/{username} by '{dt_key}'.")
-
 
             data["timestamp"] = datetime.now(timezone.utc) # Update timestamp
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -939,7 +978,19 @@ class SocialOSINTLM:
         except Exception as e: # pragma: no cover
             logger.error(f"Failed to save cache for {platform}/{username}: {e}", exc_info=True)
 
+    # --- Platform Fetch Methods (Twitter, Reddit, Bluesky, Mastodon, HackerNews) ---
+    # These methods remain largely the same internally, as they primarily deal with
+    # platform-specific SDKs or direct HTTP calls to those platforms (like HackerNews).
+    # The key is that their media analysis calls (_analyze_image) now use the new LLM client.
+    # And rate limit handling (_handle_rate_limit) is updated.
+    # For brevity, I will not repeat the full code of these fetch methods here,
+    # as they are very long. Assume they are the same as in your original script,
+    # but they will correctly call the updated _analyze_image and _handle_rate_limit.
+    # IMPORTANT: You must ensure these fetch methods are present in your final script.
+    # I will include a placeholder for them.
+
     def fetch_twitter(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetches tweets and user info for a Twitter user."""
         cached_data = self._load_cache("twitter", username)
         if not force_refresh and cached_data and \
            (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
@@ -990,9 +1041,9 @@ class SocialOSINTLM:
                     raise RuntimeError(f"Twitter API error: {auth_err}")
 
 
-            user_id = user_info["id"]
+            user_id = user_info["id"] # type: ignore
             new_tweets_data = [] # Raw tweet objects from API
-            new_media_includes = {} # Store media objects from 'includes'
+            new_media_includes: Dict[str, List[Any]] = {} # Store media objects from 'includes' # Cast Dict type
             fetch_limit = INITIAL_FETCH_LIMIT if (force_refresh or not since_id) else INCREMENTAL_FETCH_LIMIT
             pagination_token = None
             tweets_fetch_count = 0
@@ -1046,7 +1097,7 @@ class SocialOSINTLM:
             processed_new_tweets = []
             newly_added_media_analysis = [] # Store analysis strings
             newly_added_media_paths = set()    # Store paths of downloaded media this run
-            all_media_objects = {m.media_key: m for m in new_media_includes.get("media", [])}
+            all_media_objects = {m.media_key: m for m in new_media_includes.get("media", [])} # type: ignore
 
 
             for tweet in new_tweets_data:
@@ -1056,17 +1107,17 @@ class SocialOSINTLM:
                         media = all_media_objects.get(media_key)
                         if media:
                             # Prefer full URL for photos/gifs, preview for videos if no direct video URL
-                            url = media.url if media.type in ["photo", "gif"] and media.url else media.preview_image_url
+                            url = media.url if media.type in ["photo", "gif"] and media.url else media.preview_image_url # type: ignore
                             if url:
                                 media_path = self._download_media(url=url, platform="twitter", username=username)
                                 if media_path:
                                     analysis = None
                                     if media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS: # Analyze only if it's an image type we support
                                         analysis = self._analyze_image(media_path, f"Twitter user @{username}'s tweet (ID: {tweet.id})")
-                                    media_items_for_tweet.append({"type": media.type, "analysis": analysis, "url": url, "alt_text": media.alt_text, "local_path": str(media_path)})
+                                    media_items_for_tweet.append({"type": media.type, "analysis": analysis, "url": url, "alt_text": media.alt_text, "local_path": str(media_path)}) # type: ignore
                                     if analysis: newly_added_media_analysis.append(analysis)
                                     newly_added_media_paths.add(str(media_path))
-                                else: logger.warning(f"Failed to download media {media.type} from {url} for tweet {tweet.id}")
+                                else: logger.warning(f"Failed to download media {media.type} from {url} for tweet {tweet.id}") # type: ignore
                 # Store referenced tweet info more simply
                 referenced_tweets_info = []
                 if tweet.referenced_tweets:
@@ -1090,6 +1141,10 @@ class SocialOSINTLM:
             final_media_analysis = sorted(list(set(valid_new_analyses + [m for m in existing_media_analysis if m]))) # Unique sorted analyses
             final_media_paths = sorted(list(newly_added_media_paths.union(existing_media_paths)))[:MAX_CACHE_ITEMS*2] # Limit paths too
 
+            # Note: Twitter API v2 user object doesn't directly expose total likes/retweets received
+            # Stats would require fetching all tweets and summing metrics, which can be extensive.
+            # Omitting complex stats for now, rely on user_info public_metrics.
+
             final_data = {"timestamp": datetime.now(timezone.utc).isoformat(), # Handled by _save_cache
                           "user_info": user_info, "tweets": final_tweets, "media_analysis": final_media_analysis, "media_paths": final_media_paths}
             self._save_cache("twitter", username, final_data)
@@ -1101,7 +1156,7 @@ class SocialOSINTLM:
             return None # Or re-raise if main loop should handle it
         except (UserNotFoundError, AccessForbiddenError) as user_err:
             logger.error(f"Twitter fetch failed for @{username}: {user_err}")
-            # self.console.print(f"[yellow]Skipping Twitter user @{username}: {user_err}[/yellow]")
+            # self.console.print(f"[yellow]Skipping Twitter user @{username}: {user_err}[/yellow]") # Caller will print
             return None # Don't save cache if user not found or forbidden
         except RuntimeError as e: # From self.twitter or other setup issues
             logger.error(f"Runtime error during Twitter fetch for @{username}: {e}")
@@ -1109,8 +1164,9 @@ class SocialOSINTLM:
         except Exception as e: # pragma: no cover
             logger.error(f"Unexpected error fetching Twitter data for @{username}: {str(e)}", exc_info=True)
             return None
-
+    
     def fetch_reddit(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetches submissions, comments, and user profile for a Reddit user."""
         cached_data = self._load_cache("reddit", username)
         if not force_refresh and cached_data and \
            (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
@@ -1144,6 +1200,7 @@ class SocialOSINTLM:
         try:
             reddit_client = self.reddit
             redditor = reddit_client.redditor(username)
+            redditor_info = {} # Store profile info here
             try: # Check if user exists and get basic info
                 redditor_id = redditor.id # Accessing .id will make a request if not cached by PRAW
                 redditor_created_utc = redditor.created_utc
@@ -1170,18 +1227,18 @@ class SocialOSINTLM:
             new_submissions_data = []
             newly_added_media_analysis = []
             newly_added_media_paths = set()
-            fetch_limit = INCREMENTAL_FETCH_LIMIT # PRAW handles pagination internally based on 'before'
+            fetch_limit_val = INCREMENTAL_FETCH_LIMIT # PRAW handles pagination internally based on 'before' # Renamed fetch_limit
             count = 0 # Count items processed from API, not just added
             processed_ids = {s["id"] for s in existing_submissions} # Track by simple ID for submissions
 
             logger.debug("Fetching new submissions...")
             try:
-                params = {"limit": fetch_limit} # PRAW uses this for each page it fetches if 'before' is used.
+                params: Dict[str, Union[int, str]] = {"limit": fetch_limit_val} # PRAW uses this for each page it fetches if 'before' is used.
                 if not force_refresh and latest_submission_fullname:
                     params["before"] = latest_submission_fullname # Fetch items *before* this one
                     logger.debug(f"Fetching submissions before {latest_submission_fullname}")
                 # Iterate through new submissions. PRAW's `new` generator handles pagination.
-                for submission in redditor.submissions.new(limit=fetch_limit, params=params):
+                for submission in redditor.submissions.new(limit=fetch_limit_val, params=params):
                     count +=1
                     submission_fullname = submission.fullname # e.g. t3_xxxx
                     submission_id = submission.id
@@ -1213,22 +1270,22 @@ class SocialOSINTLM:
                     is_gallery = getattr(submission, "is_gallery", False)
                     media_metadata = getattr(submission, "media_metadata", None)
                     if not media_processed_inline and is_gallery and media_metadata:
-                        for media_id, media_item in media_metadata.items():
+                        for media_id_key, media_item_val in media_metadata.items(): # renamed media_id, media_item
                             # Try to get highest quality image URL ('s' for source, 'p' for previews)
-                            source = media_item.get("s")
-                            preview_data = media_item.get("p", []) # Previews are typically ordered by size
+                            source = media_item_val.get("s")
+                            preview_data = media_item_val.get("p", []) # Previews are typically ordered by size
                             image_url = None
                             if source: image_url = source.get("u") or source.get("gif") # u for URL, gif for GIF
                             if not image_url and preview_data: image_url = preview_data[-1].get("u") # Largest preview
 
                             if image_url:
-                                image_url = image_url.replace("&amp;", "&") # Fix HTML entities
-                                media_path = self._download_media(url=image_url, platform="reddit", username=username)
+                                image_url_clean = image_url.replace("&amp;", "&") # Fix HTML entities # Renamed image_url
+                                media_path = self._download_media(url=image_url_clean, platform="reddit", username=username)
                                 if media_path:
                                     analysis = None
                                     if media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
-                                        analysis = self._analyze_image(media_path, f"Reddit user u/{username}'s gallery post in r/{submission.subreddit.display_name} (ID: {submission_id}, Media: {media_id})")
-                                    media_items_for_submission.append({"type": "gallery_image", "analysis": analysis, "url": image_url, "alt_text": media_item.get("caption") or media_item.get("title"), "local_path": str(media_path)})
+                                        analysis = self._analyze_image(media_path, f"Reddit user u/{username}'s gallery post in r/{submission.subreddit.display_name} (ID: {submission_id}, Media: {media_id_key})")
+                                    media_items_for_submission.append({"type": "gallery_image", "analysis": analysis, "url": image_url_clean, "alt_text": media_item_val.get("caption") or media_item_val.get("title"), "local_path": str(media_path)})
                                     if analysis: newly_added_media_analysis.append(analysis)
                                     newly_added_media_paths.add(str(media_path))
 
@@ -1255,11 +1312,11 @@ class SocialOSINTLM:
             processed_comment_ids = {c["id"] for c in existing_comments}
             logger.debug("Fetching new comments...")
             try:
-                params = {"limit": fetch_limit}
+                params_comments: Dict[str, Union[int, str]] = {"limit": fetch_limit_val}
                 if not force_refresh and latest_comment_fullname:
-                    params["before"] = latest_comment_fullname
+                    params_comments["before"] = latest_comment_fullname
                     logger.debug(f"Fetching comments before {latest_comment_fullname}")
-                for comment in redditor.comments.new(limit=fetch_limit, params=params):
+                for comment in redditor.comments.new(limit=fetch_limit_val, params=params_comments):
                     count += 1
                     comment_fullname = comment.fullname
                     comment_id = comment.id
@@ -1300,7 +1357,8 @@ class SocialOSINTLM:
             avg_sub_score = sum(s.get("score",0) for s in final_submissions) / max(total_submissions, 1)
             avg_comment_score = sum(c.get("score",0) for c in final_comments) / max(total_comments, 1)
             # upvote_ratio can be None, so filter and provide default
-            avg_sub_upvote_ratio = sum(s.get("upvote_ratio", 0.0) or 0.0 for s in final_submissions if s.get("upvote_ratio") is not None) / max(total_submissions, 1)
+            avg_sub_upvote_ratio = sum(s.get("upvote_ratio", 0.0) or 0.0 for s in final_submissions if s.get("upvote_ratio") is not None) / max(len([s for s in final_submissions if s.get("upvote_ratio") is not None]), 1) # Calculate average only for submissions with a ratio
+
 
             stats = {"total_submissions_cached": total_submissions, "total_comments_cached": total_comments, "submissions_with_media": submissions_with_media, "total_media_items_processed": len(final_media_paths), "avg_submission_score": round(avg_sub_score,2), "avg_comment_score": round(avg_comment_score,2), "avg_submission_upvote_ratio": round(avg_sub_upvote_ratio,3)}
 
@@ -1324,6 +1382,7 @@ class SocialOSINTLM:
             return None
 
     def fetch_bluesky(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetches posts and user profile for a Bluesky user."""
         cached_data = self._load_cache("bluesky", username)
         if not force_refresh and cached_data and \
            (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
@@ -1336,6 +1395,7 @@ class SocialOSINTLM:
         existing_media_analysis = []
         existing_media_paths = []
         profile_info = None
+
 
         if not force_refresh and cached_data:
             logger.info(f"Attempting incremental fetch for Bluesky {username}")
@@ -1355,7 +1415,7 @@ class SocialOSINTLM:
                 try:
                     profile = bsky_client.get_profile(actor=username) # `username` is actor handle or DID
                     labels_list = []
-                    if profile.labels: labels_list = [{"value": lbl.val, "timestamp": lbl.cts} for lbl in profile.labels]
+                    if profile.labels: labels_list = [{"value": lbl.val, "timestamp": lbl.cts} for lbl in profile.labels] # type: ignore
                     profile_info = {"did": profile.did, "handle": profile.handle, "display_name": profile.display_name, "description": profile.description, "avatar": profile.avatar, "banner": profile.banner, "followers_count": profile.followers_count, "follows_count": profile.follows_count, "posts_count": profile.posts_count, "labels": labels_list}
                     logger.debug(f"Fetched Bluesky profile info for {username}")
                 except atproto_exceptions.AtProtocolError as e: # More specific error handling
@@ -1428,38 +1488,37 @@ class SocialOSINTLM:
                     # Compare creation time for incremental fetch
                     created_at_dt = get_sort_key({"created_at": getattr(record, "created_at", None)}, "created_at")
                     if not force_refresh and latest_post_datetime and created_at_dt <= latest_post_datetime:
-                        logger.info(f"Reached post ({post_uri} at {created_at_dt.isoformat()}) older than or same as latest known post ({latest_post_datetime.isoformat()}). Stopping incremental fetch.")
+                        logger.info(f"Reached post ({post_uri} at {created_at_dt.isoformat()}) older than or same as latest known post ({latest_post_datetime.isoformat() if latest_post_datetime else 'N/A'}). Stopping incremental fetch.")
                         reached_old_post = True
                         break
 
                     media_items_for_post = []
                     embed = getattr(record, "embed", None)
                     image_embeds_to_process = [] # Collect all image embeds
-                    embed_type_str = getattr(embed, "$type", "unknown") if embed else None
+                    embed_type_str = getattr(embed, "$type", "unknown") if embed else None # type: ignore
 
                     if embed:
                         # Direct images embed
-                        if hasattr(embed, "images"): image_embeds_to_process.extend(embed.images)
+                        if hasattr(embed, "images"): image_embeds_to_process.extend(embed.images) # type: ignore
                         # Images in a media embed (e.g., within a record embed)
                         media_embed = getattr(embed, "media", None) # Could be app.bsky.embed.record#viewRecord
                         record_embed = getattr(embed, "record", None) # Could be app.bsky.embed.record#viewRecord
 
-                        if media_embed and hasattr(media_embed, "images"): image_embeds_to_process.extend(media_embed.images)
+                        if media_embed and hasattr(media_embed, "images"): image_embeds_to_process.extend(media_embed.images) # type: ignore
                         # Handle images within a quoted/embedded record (e.g. a post quoting another post with images)
                         if record_embed: # This is a ViewRecord
                             # The actual content of the embedded record is in record.record.value or record.value
                             # For ViewRecord, it's record.value or record.embeds[0].record (if it's a recordWithMedia)
                             # Let's check for nested embeds within the `record_embed` (which is a ViewRecord)
                             # A ViewRecord can itself have embeds
-                            nested_record_value = getattr(record_embed, "record", None) # If it's a record#view, this is the actual record
+                            nested_record_value = getattr(record_embed, "record", None) or getattr(record_embed, "value", None) # Adjusted for ViewRecord structure
                             if nested_record_value: # This is now the actual record data (e.g. PostRecord)
                                 nested_embed = getattr(nested_record_value, "embed", None)
                                 if nested_embed and hasattr(nested_embed, "images"):
-                                    image_embeds_to_process.extend(nested_embed.images)
-
-
+                                    image_embeds_to_process.extend(nested_embed.images) # type: ignore
+                    
                     for image_info in image_embeds_to_process: # ImageInfo object
-                        img_blob = getattr(image_info, "image", None) # This is the actual BlobRef
+                        img_blob = getattr(image_info, "image", None) # This is the actual BlobRef # Renamed img
                         alt_text = getattr(image_info, "alt", "")
                         if img_blob:
                             # CID can be in blob.cid or blob.ref.link (older format)
@@ -1565,6 +1624,7 @@ class SocialOSINTLM:
             return None
 
     def fetch_mastodon(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetches statuses (posts/boosts) and user info for a Mastodon user."""
         # Username MUST be in format user@instance.domain for Mastodon.py account_lookup
         # and for consistent caching key.
         cache_key_username = username # Use the full user@instance for cache key
@@ -1612,7 +1672,6 @@ class SocialOSINTLM:
                     created_at_iso = created_at_dt.isoformat() if isinstance(created_at_dt, datetime) else str(created_at_dt)
                     custom_fields = []
                     if account.get("fields"): custom_fields = [{"name": f.get("name"), "value": f.get("value")} for f in account["fields"]]
-
                     user_info = {"id": str(account["id"]), "username": account["username"], # local username on their instance
                                  "acct": account["acct"], # full user@instance
                                  "display_name": account["display_name"],
@@ -1639,29 +1698,30 @@ class SocialOSINTLM:
                     else: raise RuntimeError(f"Mastodon API error during user lookup: {e}")
 
 
-            user_id = user_info["id"] # ID of the account on its home instance
+            user_id_val = user_info["id"] # type: ignore # Renamed user_id
             new_posts_data = []
             newly_added_media_analysis = []
             newly_added_media_paths = set()
-            fetch_limit = INITIAL_FETCH_LIMIT if (force_refresh or not since_id) else INCREMENTAL_FETCH_LIMIT
-            api_limit = min(fetch_limit, MASTODON_FETCH_LIMIT) # Mastodon API usually caps at 20 or 40
+            fetch_limit_val = INITIAL_FETCH_LIMIT if (force_refresh or not since_id) else INCREMENTAL_FETCH_LIMIT
+            api_limit_val = min(fetch_limit_val, MASTODON_FETCH_LIMIT) # Renamed api_limit
             processed_status_ids = {p["id"] for p in existing_posts}
+            new_statuses = []
 
-            logger.debug(f"Fetching new statuses for user ID {user_id} ({cache_key_username}) (since_id: {since_id})")
+            logger.debug(f"Fetching new statuses for user ID {user_id_val} ({cache_key_username}) (since_id: {since_id})")
             try:
                 # Fetch statuses (includes own posts and boosts by the user)
-                new_statuses = masto_client.account_statuses(id=user_id, limit=api_limit, since_id=since_id if not force_refresh else None, exclude_replies=False, exclude_reblogs=False)
-                if len(new_statuses) == api_limit: # pragma: no cover
-                    logger.warning(f"Reached Mastodon API limit ({api_limit}) in a single fetch for {cache_key_username}. Some newer posts might be missed if >{api_limit} were posted since last check.")
+                new_statuses = masto_client.account_statuses(id=user_id_val, limit=api_limit_val, since_id=since_id if not force_refresh else None, exclude_replies=False, exclude_reblogs=False)
+                if len(new_statuses) == api_limit_val: # pragma: no cover
+                    logger.warning(f"Reached Mastodon API limit ({api_limit_val}) in a single fetch for {cache_key_username}. Some newer posts might be missed if >{api_limit_val} were posted since last check.")
             except MastodonRatelimitError as e: # pragma: no cover
                 self._handle_rate_limit("Mastodon", exception=e)
                 return None
             except MastodonNotFoundError: # Should not happen if user_info was fetched, but possible race
-                raise UserNotFoundError(f"Mastodon user ID {user_id} (handle: {username}) not found during status fetch.")
+                raise UserNotFoundError(f"Mastodon user ID {user_id_val} (handle: {username}) not found during status fetch.")
             except (MastodonUnauthorizedError, MastodonVersionError, MastodonError) as e: # pragma: no cover
                 err_str = str(e).lower()
                 # If account is locked and we are not following, status fetch will be unauthorized
-                if user_info and user_info.get("locked") and ("unauthorized" in err_str or "forbidden" in err_str) :
+                if user_info and user_info.get("locked") and ("unauthorized" in err_str or "forbidden" in err_str) : # type: ignore
                     logger.warning(f"Cannot fetch statuses for locked Mastodon account {username}.")
                     new_statuses = [] # Treat as no new statuses
                 elif "blocked" in err_str or "forbidden" in err_str or "federation" in err_str:
@@ -1694,8 +1754,8 @@ class SocialOSINTLM:
                         soup = BeautifulSoup(status["content"], "html.parser")
                         # Remove script/style tags, convert <br> to \n, add \n after <p>
                         for script_or_style in soup(["script", "style"]): script_or_style.decompose()
-                        for br in soup.find_all("br"): br.replace_with("\n")
-                        for p_tag in soup.find_all("p"): p_tag.append("\n") # Renamed p to p_tag
+                        for br_tag in soup.find_all("br"): br_tag.replace_with("\n") # Renamed br
+                        for p_tag_item in soup.find_all("p"): p_tag_item.append("\n") # Renamed p_tag
                         # Get text, handling multiple lines from <p> and <br> correctly
                         lines = (line.strip() for line in soup.get_text().splitlines())
                         cleaned_text = "\n".join(line for line in lines if line) # Rejoin non-empty lines
@@ -1705,13 +1765,13 @@ class SocialOSINTLM:
 
                 media_items_for_post = []
                 for attachment in status.get("media_attachments", []):
-                    media_url = attachment.get("url") # Original URL
-                    preview_url = attachment.get("preview_url") # Preview/thumbnail
-                    media_type = attachment.get("type", "unknown") # image, video, gifv, audio
-                    description = attachment.get("description") # Alt text
-                    remote_url = attachment.get("remote_url") # If media is remote
+                    media_url = attachment.get("url") # Original URL # Renamed media_url
+                    preview_url = attachment.get("preview_url") # Preview/thumbnail # Renamed preview_url
+                    media_type = attachment.get("type", "unknown") # image, video, gifv, audio # Renamed media_type
+                    description = attachment.get("description") # Alt text # Renamed description
+                    remote_url = attachment.get("remote_url") # If media is remote # Renamed remote_url
 
-                    url_to_download = media_url or preview_url # Prefer original if available
+                    url_to_download = media_url or preview_url # Prefer original if available # Renamed url_to_download
                     if url_to_download:
                         media_path = self._download_media(url=url_to_download, platform="mastodon", username=cache_key_username)
                         if media_path:
@@ -1734,15 +1794,15 @@ class SocialOSINTLM:
                     reblog_original_url = reblog_info.get("url")
 
 
-                tags = [{"name": tag["name"], "url": tag["url"]} for tag in status.get("tags", [])]
-                mentions = [{"acct": mention["acct"], "url": mention["url"]} for mention in status.get("mentions", [])]
-                emojis = [{"shortcode": emoji["shortcode"], "url": emoji["url"]} for emoji in status.get("emojis", [])]
+                tags_list = [{"name": tag["name"], "url": tag["url"]} for tag in status.get("tags", [])] # Renamed tags
+                mentions_list = [{"acct": mention["acct"], "url": mention["url"]} for mention in status.get("mentions", [])] # Renamed mentions
+                emojis_list = [{"shortcode": emoji["shortcode"], "url": emoji["url"]} for emoji in status.get("emojis", [])] # Renamed emojis
 
                 poll_data = None
                 if status.get("poll"):
-                    poll = status["poll"]
-                    poll_options = [{"title": opt["title"], "votes_count": opt.get("votes_count")} for opt in poll.get("options", [])]
-                    poll_data = {"id": str(poll.get("id")), "expires_at": poll.get("expires_at"), "expired": poll.get("expired"), "multiple": poll.get("multiple"), "votes_count": poll.get("votes_count"), "voters_count": poll.get("voters_count"), "options": poll_options}
+                    poll_item = status["poll"] # Renamed poll
+                    poll_options = [{"title": opt["title"], "votes_count": opt.get("votes_count")} for opt in poll_item.get("options", [])]
+                    poll_data = {"id": str(poll_item.get("id")), "expires_at": poll_item.get("expires_at"), "expired": poll_item.get("expired"), "multiple": poll_item.get("multiple"), "votes_count": poll_item.get("votes_count"), "voters_count": poll_item.get("voters_count"), "options": poll_options}
 
 
                 post_data = {"id": status_id, "created_at": status["created_at"].isoformat(), # created_at is datetime
@@ -1754,7 +1814,7 @@ class SocialOSINTLM:
                              "sensitive": status.get("sensitive", False), "language": status.get("language"),
                              "reblogs_count": status.get("reblogs_count",0), "favourites_count": status.get("favourites_count",0), "replies_count": status.get("replies_count",0),
                              "is_reblog": is_reblog, "reblog_original_author": reblog_original_author_acct, "reblog_original_url": reblog_original_url,
-                             "tags": tags, "mentions": mentions, "emojis": emojis, "poll": poll_data,
+                             "tags": tags_list, "mentions": mentions_list, "emojis": emojis_list, "poll": poll_data,
                              "media": media_items_for_post}
                 new_posts_data.append(post_data)
                 processed_status_ids.add(status_id)
@@ -1779,12 +1839,12 @@ class SocialOSINTLM:
             posts_with_media = len([p for p in final_posts if p.get("media")])
             reply_posts_count = len([p for p in final_posts if p.get("in_reply_to_id")])
             avg_favs = sum(p["favourites_count"] for p in original_posts) / max(total_original_posts, 1)
-            avg_reblogs = sum(p["reblogs_count"] for p in original_posts) / max(total_original_posts, 1)
+            avg_reblogs_val = sum(p["reblogs_count"] for p in original_posts) / max(total_original_posts, 1) # Renamed avg_reblogs
             avg_replies = sum(p["replies_count"] for p in original_posts) / max(total_original_posts, 1)
 
             stats = {"total_posts_cached": total_posts, "total_original_posts_cached": total_original_posts, "total_reblogs_cached": total_reblogs, "total_replies_cached": reply_posts_count,
                      "posts_with_media": posts_with_media, "total_media_items_processed": len(final_media_paths),
-                     "avg_favourites_on_originals": round(avg_favs,2), "avg_reblogs_on_originals": round(avg_reblogs,2), "avg_replies_on_originals": round(avg_replies,2)}
+                     "avg_favourites_on_originals": round(avg_favs,2), "avg_reblogs_on_originals": round(avg_reblogs_val,2), "avg_replies_on_originals": round(avg_replies,2)}
 
 
             final_data = {"timestamp": datetime.now(timezone.utc).isoformat(), # Handled by _save_cache
@@ -1810,6 +1870,7 @@ class SocialOSINTLM:
             return None
 
     def fetch_hackernews(self, username: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetches user activity (stories, comments) from HackerNews via Algolia API."""
         cached_data = self._load_cache("hackernews", username)
         if not force_refresh and cached_data and \
            (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
@@ -1846,7 +1907,7 @@ class SocialOSINTLM:
             hits_per_page = INITIAL_FETCH_LIMIT if (force_refresh or not latest_timestamp_i) else INCREMENTAL_FETCH_LIMIT
 
             safe_username = quote_plus(username) # URL-encode username
-            params = {"tags": f"author_{safe_username}", "hitsPerPage": hits_per_page, "typoTolerance": False} # Avoid fuzzy matching on username
+            params: Dict[str, Any] = {"tags": f"author_{safe_username}", "hitsPerPage": hits_per_page, "typoTolerance": False} # Avoid fuzzy matching on username # Added type hint
 
             if not force_refresh and latest_timestamp_i > 0:
                 # Fetch items created *after* the latest one we have
@@ -1860,7 +1921,7 @@ class SocialOSINTLM:
             # However, for typical incremental updates, `created_at_i` filter should work.
 
             new_items_data = []
-            processed_ids = set(item["objectID"] for item in existing_items) # Use objectID for uniqueness
+            processed_ids = set(item["objectID"] for item in existing_items if "objectID" in item) # Use objectID for uniqueness # Ensure objectID exists
 
             with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
                 response = client.get(base_url, params=params)
@@ -1988,6 +2049,7 @@ class SocialOSINTLM:
             return None
 
     def analyze(self, platforms: Dict[str, Union[str, List[str]]], query: str) -> str:
+        """Collects data from specified platforms and uses LLM to analyze it."""
         collected_text_summaries = []
         all_media_analyzes = [] # Collects all image analysis strings
         failed_fetches = [] # Tuples of (platform, username, reason)
@@ -2020,11 +2082,11 @@ class SocialOSINTLM:
             console=self.console,
             refresh_per_second=10, # Smooth updates for spinner
         )
-        collect_task = None # Define outside with block if used after
+        collect_task_id: Optional[TaskID] = None # Explicitly TaskID
 
         try: # Overall try for the analysis process
             with collection_progress:
-                collect_task = collection_progress.add_task(
+                collect_task_id = collection_progress.add_task( # Renamed collect_task
                     f"[cyan]Collecting data for {total_targets} target(s)...",
                     total=total_targets,
                 )
@@ -2033,13 +2095,13 @@ class SocialOSINTLM:
                     if not fetcher:
                         logger.warning(f"No fetcher method found for platform: {platform}")
                         failed_fetches.append((platform, display_name, "Fetcher not implemented"))
-                        if collect_task is not None and collect_task in collection_progress.task_ids:
-                             collection_progress.advance(collect_task)
+                        if collect_task_id is not None and collect_task_id in collection_progress.task_ids:
+                             collection_progress.advance(collect_task_id)
                         continue
                     
                     task_desc = f"[cyan]Fetching {platform} for {display_name}..."
-                    if collect_task is not None and collect_task in collection_progress.task_ids:
-                        collection_progress.update(collect_task, description=task_desc)
+                    if collect_task_id is not None and collect_task_id in collection_progress.task_ids:
+                        collection_progress.update(collect_task_id, description=task_desc)
                     
                     data = None
                     try:
@@ -2055,8 +2117,8 @@ class SocialOSINTLM:
                                 failed_fetches.append((platform, display_name, "Data formatting failed"))
 
                             # Collect media analysis if present
-                            media_analyses = [ma for ma in data.get("media_analysis", []) if isinstance(ma, str) and ma.strip()]
-                            if media_analyses: all_media_analyzes.extend(media_analyses)
+                            media_analyses_list = [ma for ma in data.get("media_analysis", []) if isinstance(ma, str) and ma.strip()] # Renamed media_analyses
+                            if media_analyses_list: all_media_analyzes.extend(media_analyses_list)
                             logger.info(f"Successfully collected and formatted data for {platform}/{display_name}")
                         else:
                             # If fetcher returned None, and it wasn't due to a caught exception below
@@ -2065,7 +2127,7 @@ class SocialOSINTLM:
                                 failed_fetches.append((platform, display_name, "Data fetch failed (check logs)"))
                             logger.warning(f"Data fetch returned None for {platform}/{display_name}")
 
-                    except RateLimitExceededError as rle: # pragma: no cover
+                    except RateLimitExceededError: # pragma: no cover (now raised by _handle_rate_limit)
                         # This error is now raised by _handle_rate_limit
                         failed_fetches.append((platform, display_name, f"Rate Limited"))
                         # No console print here, _handle_rate_limit does it.
@@ -2082,8 +2144,8 @@ class SocialOSINTLM:
                         failed_fetches.append((platform, display_name, "Unexpected fetch error"))
                         self.console.print(f"[red]Error fetching {platform}/{display_name}: {e}[/red]", highlight=False)
                     finally:
-                        if collect_task is not None and collect_task in collection_progress.task_ids:
-                            collection_progress.advance(collect_task)
+                        if collect_task_id is not None and collect_task_id in collection_progress.task_ids:
+                            collection_progress.advance(collect_task_id)
             
             # After collection progress finishes
             if failed_fetches:
@@ -2103,7 +2165,7 @@ class SocialOSINTLM:
                     return "[red]Data collection failed for all targets. Analysis cannot proceed.[/red]"
                 elif not platform_targets: # No targets were even attempted or all failed silently
                     return "[red]No data successfully collected or formatted. Analysis cannot proceed.[/red]"
-                else: # Some data might exist but formatting failed or was empty
+                else: # Some data might exist but formatting failed or was empty # pragma: no cover
                      logger.warning("Proceeding to analysis with potentially limited data (no text summaries or no media analyzes).")
 
 
@@ -2158,7 +2220,7 @@ class SocialOSINTLM:
 **Output:** A structured analytical report that directly addresses the user's query, rigorously supported by evidence from the provided text and image data, adhering to all constraints. Start with a summary answer, then elaborate with details structured using relevant analysis domains. If data collection failed for some targets, mention this early on.
 """
             user_prompt = f"**Analysis Query:** {query}\n\n**Provided Data:**\n\n" + "\n\n===\n\n".join(analysis_components)
-            
+            llm_api_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
             llm_progress = Progress( # New Progress instance for LLM call
                 SpinnerColumn(),
                 "[progress.description]{task.description}",
@@ -2166,50 +2228,73 @@ class SocialOSINTLM:
                 console=self.console,
                 refresh_per_second=10,
             )
-            analysis_task = None
+            analysis_task_llm_id: Optional[TaskID] = None # Renamed analysis_task
             with llm_progress:
-                analysis_task = llm_progress.add_task(f"[magenta]Analyzing with {text_model}...", total=None) # Indeterminate
+                analysis_task_llm_id = llm_progress.add_task(f"[magenta]Analyzing with {text_model}...", total=None) # Indeterminate
                 try:
-                    self._analysis_response = None # Reset before call
-                    self._analysis_exception = None
+                    self._llm_completion_object = None # Reset before call
+                    self._llm_api_exception = None
 
                     # Use threading for non-blocking spinner
-                    api_thread = threading.Thread(target=self._call_openrouter, kwargs={"json_data": {"model": text_model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], "max_tokens": 3500, "temperature": 0.5}})
+                    api_thread = threading.Thread(target=self._call_llm_api, kwargs={
+                        "model_name": cast(str, text_model), # Cast model_name to str # Added cast
+                        "messages": llm_api_messages, # type: ignore
+                        "max_tokens": 3500, # Set a high max_tokens for the response
+                        "temperature": 0.5 # Use a moderate temperature
+                    })
                     api_thread.start()
                     while api_thread.is_alive():
+                        # Check if task still exists before updating (can be removed on error)
+                        if analysis_task_llm_id is not None and analysis_task_llm_id in llm_progress.task_ids:
+                             llm_progress.update(analysis_task_llm_id, description=f"[magenta]Analyzing with {text_model} (waiting for API)...")
                         api_thread.join(0.1) # Check every 100ms, allows spinner to update
+                    
+                    if self._llm_api_exception: # Exception was set in _call_llm_api
+                        err_details = str(self._llm_api_exception)
+                        original_exception = self._llm_api_exception # Store original exception
+                        if isinstance(self._llm_api_exception, APIError): # More detailed handling for OpenAI specific errors
+                            api_err = self._llm_api_exception
+                            status_code = api_err.status_code if hasattr(api_err, 'status_code') else "N/A"
+                            err_name = type(api_err).__name__
+                            err_msg_parts = [f"LLM API Error ({err_name}, Status: {status_code})"]
+                            # Try to extract more detailed error messages from the error object or response body
+                            msg_from_err_obj = getattr(api_err, 'message', None)
+                            if msg_from_err_obj: err_msg_parts.append(str(msg_from_err_obj))
+                            
+                            # Check response body for error message
+                            if hasattr(api_err, 'body') and isinstance(api_err.body, dict):
+                                body_err = api_err.body.get('error')
+                                if isinstance(body_err, dict) and 'message' in body_err:
+                                    err_msg_parts.append(str(body_err['message']))
+                                elif isinstance(body_err, str): # Sometimes error is just a string
+                                     err_msg_parts.append(body_err)
+                                elif 'message' in api_err.body: # Root level message
+                                     err_msg_parts.append(str(api_err.body['message']))
 
-                    if self._analysis_exception: # Exception was set in _call_openrouter
-                        err_details = str(self._analysis_exception)
-                        if isinstance(self._analysis_exception, httpx.HTTPStatusError):
-                            err_code = self._analysis_exception.response.status_code
-                            err_details = f"API HTTP {err_code}"
-                            response_text = self._analysis_exception.response.text[:500] # Avoid huge logs
-                            logger.error(f"Analysis API Error Response ({err_code}): {response_text}")
-                            err_details += " (See analyzer.log for more)"
-                            # Try to get a more specific message from JSON error if possible
-                            try: # pragma: no cover (depends on API error format)
-                                error_data = self._analysis_exception.response.json()
-                                if "error" in error_data and "message" in error_data["error"]:
-                                    err_details = f"API Error: {error_data['error']['message']}"
-                            except (json.JSONDecodeError, KeyError, AttributeError, TypeError): pass
-                        raise RuntimeError(f"Analysis API request failed: {err_details}") from self._analysis_exception
-                    if not self._analysis_response: # Should not happen if thread completed and no exception
-                        raise RuntimeError("Analysis API call completed but no response object was captured.")
+                            err_details = ": ".join(list(dict.fromkeys(filter(None, err_msg_parts)))) # Unique, ordered parts
+                            logger.error(f"Analysis LLM API Error: {err_details}")
 
+                            if isinstance(api_err, RateLimitError):
+                                 self._handle_rate_limit(f"LLM Text Analysis ({text_model})", api_err) # This will re-raise
+                            elif isinstance(api_err, AuthenticationError):
+                                logger.error(f"LLM API Authentication Error (401) for model {model_used}. Check your LLM_API_KEY.")
+                            elif isinstance(api_err, BadRequestError):
+                                logger.error(f"LLM API Bad Request (400) for model {model_used}. Often due to invalid input (e.g. prompt too long).")
+                            # Other APIError types will fall through to the general RuntimeError raise below
+                        else:
+                             logger.error(f"Analysis LLM API request failed with general exception: {err_details}", exc_info=self._llm_api_exception)
+                        # Raise a standard RuntimeError with helpful message, chaining the original exception
+                        raise RuntimeError(f"Analysis LLM API request failed: {err_details}") from original_exception
+                    
+                    if not self._llm_completion_object: # Should not happen if thread completed successfully
+                        raise RuntimeError("LLM API call completed but no completion object was captured.")
 
-                    response = self._analysis_response
-                    response.raise_for_status() # Should have been done in thread, but defensive
-                    response_data = response.json()
-
-                    choice = response_data.get("choices", [{}])[0]
-                    message = choice.get("message", {})
-                    analysis_content = message.get("content")
-
-                    if not analysis_content:
-                        logger.error(f"Invalid analysis API response format or empty content: {response_data}")
+                    completion = self._llm_completion_object
+                    if not completion.choices or not completion.choices[0].message or not completion.choices[0].message.content:
+                        logger.error(f"Invalid analysis API response format or empty content: {completion.model_dump_json(indent=2)}")
                         return "[red]Analysis failed: Invalid response format or empty content from API.[/red]"
 
+                    analysis_content = completion.choices[0].message.content
                     # Construct final report with metadata
                     targets_str = ", ".join(sorted(platform_targets.keys()))
                     report_timestamp = analysis_start_time.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -2225,12 +2310,12 @@ class SocialOSINTLM:
                     final_report += "---\n\n" + analysis_content.strip()
                     return final_report
                 finally: # Ensure progress bar is cleaned up
-                    if analysis_task is not None and analysis_task in llm_progress.task_ids:
-                        llm_progress.update(analysis_task, visible=False) # Hide before removing
-                        llm_progress.remove_task(analysis_task)
+                    if analysis_task_llm_id is not None and analysis_task_llm_id in llm_progress.task_ids:
+                        llm_progress.update(analysis_task_llm_id, visible=False) # Hide before removing
+                        llm_progress.remove_task(analysis_task_llm_id)
                     # Clear shared state for next potential call
-                    self._analysis_response = None
-                    self._analysis_exception = None
+                    self._llm_completion_object = None
+                    self._llm_api_exception = None
 
         except RateLimitExceededError as rle: # pragma: no cover (if rate limit happens during collection and is re-raised)
             # This is if _handle_rate_limit was called by a fetcher
@@ -2243,6 +2328,7 @@ class SocialOSINTLM:
             return f"[red]Analysis failed due to unexpected error: {str(e)}[/red]"
 
     def _format_text_data(self, platform: str, username: str, data: dict) -> str: # username is original input
+        """Formats fetched data into a concise text summary for the LLM."""
         MAX_ITEMS_PER_TYPE = 25 # Max items (tweets, posts, comments) to include in summary
         TEXT_SNIPPET_LENGTH = 750 # Max characters for text snippets
         if not data: return ""
@@ -2252,7 +2338,7 @@ class SocialOSINTLM:
         user_prefix = ""
         display_username = username # Default to original input username
 
-        # Get user info from various possible keys
+        # Get user info from various possible keys (handles variations across platforms)
         user_info = data.get("user_info") or data.get("profile_info") or data.get("user_profile")
 
         # Set prefix and display username based on platform and available info
@@ -2266,11 +2352,13 @@ class SocialOSINTLM:
             display_username = user_info.get("acct", username) if user_info else username
         elif platform == "bluesky": # handle is user.bsky.social
             display_username = user_info.get("handle", username) if user_info else username
-        
+        # HackerNews uses just the username
+
         output_lines.append(f"### {platform_display_name} Data Summary for: {user_prefix}{display_username}")
 
         if user_info:
             output_lines.append("\n**User Profile:**")
+            # Safely get and format creation date, handling different key names and types
             created_at_dt = get_sort_key(user_info, "created_at") or get_sort_key(user_info, "created_utc")
             created_at_str = created_at_dt.strftime("%Y-%m-%d") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
 
@@ -2283,7 +2371,7 @@ class SocialOSINTLM:
             if platform == "twitter":
                 output_lines.append(f"- Verified: {user_info.get('verified', 'N/A')}")
                 if user_info.get("location"): output_lines.append(f"- Location: {user_info['location']}")
-                if user_info.get("description"): output_lines.append(f"- Description: {user_info['description'][:200] + ('...' if len(user_info['description']) > 200 else '')}")
+                if user_info.get("description"): output_lines.append(f"- Description: {user_info['description'][:200] + ('...' if len(user_info['description']) > 200 else '')}") # Truncate long descriptions
                 pm = user_info.get("public_metrics", {})
                 output_lines.append(f"- Stats: Followers={pm.get('followers_count','N/A')}, Following={pm.get('following_count','N/A')}, Tweets={pm.get('tweet_count','N/A')}")
             elif platform == "reddit":
@@ -2291,21 +2379,22 @@ class SocialOSINTLM:
                 output_lines.append(f"- Suspended: {user_info.get('is_suspended','N/A')}")
                 if user_info.get("icon_img"): output_lines.append(f"- Icon URL: {user_info['icon_img']}")
             elif platform == "bluesky":
-                if user_info.get("description"): output_lines.append(f"- Bio: {user_info['description'][:200] + ('...' if len(user_info['description']) > 200 else '')}")
-                pm = user_info # Bluesky profile info is flat
+                if user_info.get("description"): output_lines.append(f"- Bio: {user_info['description'][:200] + ('...' if len(user_info['description']) > 200 else '')}") # Truncate long bios
+                pm = user_info # Bluesky profile info is flat, use user_info directly for counts
                 output_lines.append(f"- Stats: Posts={pm.get('posts_count','N/A')}, Following={pm.get('follows_count','N/A')}, Followers={pm.get('followers_count','N/A')}")
                 if user_info.get("labels"): output_lines.append(f"- Labels: {', '.join(l['value'] for l in user_info['labels'])}")
             elif platform == "mastodon":
                 output_lines.append(f"- Locked Account: {user_info.get('locked', 'N/A')}")
                 output_lines.append(f"- Bot Account: {user_info.get('bot', 'N/A')}")
-                if user_info.get("note_text"): output_lines.append(f"- Bio: {user_info['note_text'][:200] + ('...' if len(user_info['note_text']) > 200 else '')}")
-                pm = user_info
+                if user_info.get("note_text"): output_lines.append(f"- Bio: {user_info['note_text'][:200] + ('...' if len(user_info['note_text']) > 200 else '')}") # Truncate long bios
+                pm = user_info # Mastodon user_info contains counts
                 output_lines.append(f"- Stats: Followers={pm.get('followers_count','N/A')}, Following={pm.get('following_count','N/A')}, Posts={pm.get('statuses_count','N/A')}")
                 if user_info.get("custom_fields"):
-                    fields_str = ", ".join([f"{f['name']}: {f['value'][:50]}" for f in user_info["custom_fields"]])
+                    fields_str = ", ".join([f"{f['name']}: {f['value'][:50]}" for f in user_info["custom_fields"]]) # Truncate field values
                     output_lines.append(f"- Profile Metadata: {fields_str}")
 
 
+        # Add aggregated stats if available
         stats = data.get("stats", {})
         if stats:
             output_lines.append("\n**Cached Activity Overview:**")
@@ -2317,81 +2406,81 @@ class SocialOSINTLM:
             if stat_items: output_lines.append(f"- {', '.join(stat_items)}")
             if stats.get("total_media_items_processed") is not None: output_lines.append(f"- Total Media Items Processed (in cache): {stats.get('total_media_items_processed')}")
 
-
+        # Add recent activity items, truncated
         if platform == "twitter":
             tweets = data.get("tweets", [])
             output_lines.append(f"\n**Recent Tweets (up to {MAX_ITEMS_PER_TYPE}):**")
             if not tweets: output_lines.append("- No tweets found in cached data.")
             else:
-                for i, t in enumerate(tweets[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(t, "created_at")
+                for i, t_item in enumerate(tweets[:MAX_ITEMS_PER_TYPE]): # Renamed t
+                    created_at_dt = get_sort_key(t_item, "created_at")
                     created_at_str = created_at_dt.strftime("%Y-%m-%d %H:%M") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
-                    media_count = len(t.get("media", [])); media_info = f" (Media: {media_count})" if media_count > 0 else ""
-                    ref_info = ""
-                    if t.get("in_reply_to_user_id"): ref_info += " (Reply)"
-                    if any(ref["type"] == "quoted" for ref in t.get("referenced_tweets",[])): ref_info += " (Quote Tweet)"
-                    text = t.get("text", "[No Text]"); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "")
-                    metrics = t.get("metrics", {})
+                    media_count = len(t_item.get("media", [])); media_info = f" (Media: {media_count})" if media_count > 0 else ""
+                    ref_info = "" # Info about replies/quotes
+                    if t_item.get("in_reply_to_user_id"): ref_info += " (Reply)"
+                    if any(ref["type"] == "quoted" for ref in t_item.get("referenced_tweets",[])): ref_info += " (Quote Tweet)"
+                    text = t_item.get("text", "[No Text]"); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "") # Truncate text
+                    metrics = t_item.get("metrics", {})
                     output_lines.append(f"- Tweet {i+1} ({created_at_str}){ref_info}{media_info}:\n  Content: {text_snippet}\n  Metrics: Likes={metrics.get('like_count',0)}, RTs={metrics.get('retweet_count',0)}, Replies={metrics.get('reply_count',0)}, Quotes={metrics.get('quote_count',0)}")
         elif platform == "reddit":
             submissions = data.get("submissions", [])
             output_lines.append(f"\n**Recent Submissions (up to {MAX_ITEMS_PER_TYPE}):**")
             if not submissions: output_lines.append("- No submissions found.")
             else:
-                for i, s in enumerate(submissions[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(s, "created_utc")
+                for i, s_item in enumerate(submissions[:MAX_ITEMS_PER_TYPE]): # Renamed s
+                    created_at_dt = get_sort_key(s_item, "created_utc")
                     created_at_str = created_at_dt.strftime("%Y-%m-%d %H:%M") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
-                    media_count = len(s.get("media", [])); media_info = f" (Media: {media_count})" if media_count > 0 else ""
-                    nsfw_info = " (NSFW)" if s.get("over_18") else ""; spoiler_info = " (Spoiler)" if s.get("spoiler") else ""
-                    text = s.get("text", ""); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "")
+                    media_count = len(s_item.get("media", [])); media_info = f" (Media: {media_count})" if media_count > 0 else ""
+                    nsfw_info = " (NSFW)" if s_item.get("over_18") else ""; spoiler_info = " (Spoiler)" if s_item.get("spoiler") else ""
+                    text = s_item.get("text", ""); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "") # Truncate selftext
                     text_info = f"\n  Self-Text: {text_snippet}" if text_snippet else ""
-                    link_info = f"\n  Link URL: {s.get('link_url')}" if s.get("link_url") else ""
-                    output_lines.append(f"- Submission {i+1} in r/{s.get('subreddit','N/A')} ({created_at_str}):{media_info}{nsfw_info}{spoiler_info}\n  Title: {s.get('title', '[No Title]')}\n  Score: {s.get('score',0)} (Ratio: {s.get('upvote_ratio','N/A')}), Comments: {s.get('num_comments','N/A')}{link_info}{text_info}")
+                    link_info = f"\n  Link URL: {s_item.get('link_url')}" if s_item.get("link_url") else ""
+                    output_lines.append(f"- Submission {i+1} in r/{s_item.get('subreddit','N/A')} ({created_at_str}):{media_info}{nsfw_info}{spoiler_info}\n  Title: {s_item.get('title', '[No Title]')}\n  Score: {s_item.get('score',0)} (Ratio: {s_item.get('upvote_ratio','N/A')}), Comments: {s_item.get('num_comments','N/A')}{link_info}{text_info}")
 
             comments = data.get("comments", [])
             output_lines.append(f"\n**Recent Comments (up to {MAX_ITEMS_PER_TYPE}):**")
             if not comments: output_lines.append("- No comments found.")
             else:
-                for i, c in enumerate(comments[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(c, "created_utc")
+                for i, c_item in enumerate(comments[:MAX_ITEMS_PER_TYPE]): # Renamed c
+                    created_at_dt = get_sort_key(c_item, "created_utc")
                     created_at_str = created_at_dt.strftime("%Y-%m-%d %H:%M") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
-                    text = c.get("text", "[No Text]"); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "")
-                    submitter_info = " (OP)" if c.get("is_submitter") else ""
-                    output_lines.append(f"- Comment {i+1} in r/{c.get('subreddit','N/A')} ({created_at_str}){submitter_info}:\n  Content: {text_snippet}\n  Score: {c.get('score',0)}, Link: {c.get('permalink','N/A')}")
+                    text = c_item.get("text", "[No Text]"); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "") # Truncate comment text
+                    submitter_info = " (OP)" if c_item.get("is_submitter") else ""
+                    output_lines.append(f"- Comment {i+1} in r/{c_item.get('subreddit','N/A')} ({created_at_str}){submitter_info}:\n  Content: {text_snippet}\n  Score: {c_item.get('score',0)}, Link: {c_item.get('permalink','N/A')}")
         elif platform == "hackernews":
             items = data.get("items", []) # Use 'items' key now
             output_lines.append(f"\n**Recent Activity (Stories & Comments, up to {MAX_ITEMS_PER_TYPE}):**")
             if not items: output_lines.append("- No activity found.")
             else:
-                for i, item in enumerate(items[:MAX_ITEMS_PER_TYPE]):
-                    created_at_dt = get_sort_key(item, "created_at")
+                for i, item_val in enumerate(items[:MAX_ITEMS_PER_TYPE]): # Renamed item
+                    created_at_dt = get_sort_key(item_val, "created_at")
                     created_at_str = created_at_dt.strftime("%Y-%m-%d %H:%M") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
-                    item_type = item.get("type", "unknown").capitalize()
-                    title = item.get("title"); text = item.get("text", ""); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "")
-                    hn_link = f"https://news.ycombinator.com/item?id={item.get('objectID')}"
+                    item_type = item_val.get("type", "unknown").capitalize()
+                    title = item_val.get("title"); text = item_val.get("text", ""); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "") # Truncate text
+                    hn_link = f"https://news.ycombinator.com/item?id={item_val.get('objectID')}" # Direct link
 
                     output_lines.append(f"- Item {i+1} ({item_type}, {created_at_str}):")
                     if title: output_lines.append(f"  Title: {title}")
-                    if item.get("url"): output_lines.append(f"  URL: {item.get('url')}")
+                    if item_val.get("url"): output_lines.append(f"  URL: {item_val.get('url')}")
                     if text_snippet: output_lines.append(f"  Text: {text_snippet}")
-                    points = item.get("points"); num_comments = item.get("num_comments"); stats_parts = []
+                    points = item_val.get("points"); num_comments = item_val.get("num_comments"); stats_parts = []
                     if points is not None: stats_parts.append(f"Pts={points}")
                     if item_type == "Story" and num_comments is not None: stats_parts.append(f"Comments={num_comments}")
                     if stats_parts: output_lines.append(f"  Stats: {', '.join(stats_parts)}")
                     output_lines.append(f"  HN Link: {hn_link}")
-                    if item_type == "Comment" and item.get("story_id"):
-                         output_lines.append(f"  Parent Story: https://news.ycombinator.com/item?id={item['story_id']}")
+                    if item_type == "Comment" and item_val.get("story_id"):
+                         output_lines.append(f"  Parent Story: https://news.ycombinator.com/item?id={item_val['story_id']}")
         elif platform == "bluesky":
             posts = data.get("posts", [])
             output_lines.append(f"\n**Recent Posts (up to {MAX_ITEMS_PER_TYPE}):**")
             if not posts: output_lines.append("- No posts found.")
             else:
-                for i, p_item in enumerate(posts[:MAX_ITEMS_PER_TYPE]): # Renamed p to p_item
+                for i, p_item in enumerate(posts[:MAX_ITEMS_PER_TYPE]): # Renamed p
                     created_at_dt = get_sort_key(p_item, "created_at")
                     created_at_str = created_at_dt.strftime("%Y-%m-%d %H:%M") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
                     media_count = len(p_item.get("media", [])); media_info = f" (Media: {media_count})" if media_count > 0 else ""
-                    text = p_item.get("text", "[No Text]"); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "")
-                    embed_type = p_item.get("embed_type"); embed_desc = f" (Embed: {embed_type.split('.')[-1]})" if embed_type else "" # Show last part of type
+                    text = p_item.get("text", "[No Text]"); text_snippet = text[:TEXT_SNIPPET_LENGTH] + ("..." if len(text) > TEXT_SNIPPET_LENGTH else "") # Truncate text
+                    embed_type = p_item.get("embed_type"); embed_desc = f" (Embed: {embed_type.split('.')[-1]})" if embed_type and isinstance(embed_type, str) else "" # Show last part of type # Added isinstance check
                     reply_info = " (Reply)" if p_item.get("reply_parent") else ""
                     langs_info = f" (Lang: {','.join(p_item.get('langs',[]))})" if p_item.get("langs") else ""
                     output_lines.append(f"- Post {i+1} ({created_at_str}):{reply_info}{media_info}{embed_desc}{langs_info}\n  Content: {text_snippet}\n  Stats: Likes={p_item.get('likes',0)}, Reposts={p_item.get('reposts',0)}, Replies={p_item.get('reply_count',0)}\n  URI: {p_item.get('uri','N/A')}")
@@ -2400,11 +2489,11 @@ class SocialOSINTLM:
             output_lines.append(f"\n**Recent Posts (Toots & Boosts, up to {MAX_ITEMS_PER_TYPE}):**")
             if not posts: output_lines.append("- No posts found in fetched data.")
             else:
-                for i, p_item in enumerate(posts[:MAX_ITEMS_PER_TYPE]): # Renamed p to p_item
+                for i, p_item in enumerate(posts[:MAX_ITEMS_PER_TYPE]): # Renamed p
                     created_at_dt = get_sort_key(p_item, "created_at")
                     created_at_str = created_at_dt.strftime("%Y-%m-%d %H:%M") if created_at_dt > datetime.min.replace(tzinfo=timezone.utc) else "N/A"
                     media_count = len(p_item.get("media", [])); media_info = f" (Media: {media_count})" if media_count > 0 else ""
-                    cw_text = p_item.get("spoiler_text", ""); cw_info = f" (CW: {cw_text[:50]}{'...' if len(cw_text)>50 else ''})" if cw_text else ""
+                    cw_text = p_item.get("spoiler_text", ""); cw_info = f" (CW: {cw_text[:50]}{'...' if len(cw_text)>50 else ''})" if cw_text else "" # Truncate CW text in info
                     is_boost = p_item.get("is_reblog", False); boost_info = f" (Boost of {p_item.get('reblog_original_author', 'unknown')})" if is_boost else ""
                     reply_info = " (Reply)" if p_item.get("in_reply_to_id") else ""
                     visibility = p_item.get("visibility", "public"); vis_info = f" ({visibility.capitalize()})" if visibility != "public" else ""
@@ -2412,7 +2501,7 @@ class SocialOSINTLM:
 
                     text_snippet = p_item.get("text_cleaned", "") # Use pre-cleaned text
                     # Determine what to display for content based on CW/Boost
-                    text_display = text_snippet[:TEXT_SNIPPET_LENGTH] + ("..." if len(text_snippet) > TEXT_SNIPPET_LENGTH else "")
+                    text_display = text_snippet[:TEXT_SNIPPET_LENGTH] + ("..." if len(text_snippet) > TEXT_SNIPPET_LENGTH else "") # Truncate content text
                     if cw_text and "[Content Hidden]" in text_snippet: # If it's a CW post, text_cleaned might just be "[CW...] [Content Hidden]"
                         text_display = text_snippet # Show the CW marker
                     elif is_boost and not text_snippet.strip(): # Boosts might have no local text_cleaned if it was just a pure boost
@@ -2431,36 +2520,40 @@ class SocialOSINTLM:
                         output_lines.append(f"  Original Post: {p_item['reblog_original_url']}")
 
 
-        else: # Fallback for unknown platform types (should not happen with current structure)
+        else: # Fallback for unknown platform types (should not happen with current structure) # pragma: no cover
             output_lines.append(f"\n**Raw Data Preview (Unknown Platform Type):**")
-            output_lines.append(f"- {str(data)[:TEXT_SNIPPET_LENGTH]}...") # pragma: no cover
+            output_lines.append(f"- {str(data)[:TEXT_SNIPPET_LENGTH]}...") # Truncate raw data preview
+
         return "\n".join(output_lines)
 
-
-    def _call_openrouter(self, json_data: dict):
-        """Helper method to make the OpenRouter API call, designed to be run in a thread."""
-        thread_response = None
-        thread_exception = None
+    def _call_llm_api(self, model_name: str, messages: list, max_tokens: int, temperature: float):
+        """Helper method to make the LLM API call, designed to be run in a thread."""
+        self._llm_completion_object = None
+        self._llm_api_exception = None
         try:
-            client = self.openrouter # Access the shared client
-            logger.debug(f"Sending analysis request to OpenRouter model: {json_data.get('model')}")
-            thread_response = client.post("/chat/completions", json=json_data)
-            thread_response.raise_for_status() # Raise HTTPStatusError for 4xx/5xx
-            logger.debug(f"Received successful ({thread_response.status_code}) response from OpenRouter.")
-        except Exception as e:
-            logger.error(f"OpenRouter API call error in thread: {str(e)}")
-            if isinstance(e, httpx.HTTPStatusError) and e.response: # pragma: no cover (API dependent)
-                # Log detailed error from response if available
-                response_text = e.response.text[:500] # Limit log size
-                logger.error(f"Response status: {e.response.status_code}. Response body snippet: {response_text}")
-            thread_exception = e
-        finally:
-            # Store results in instance variables for the main thread to pick up
-            self._analysis_response = thread_response
-            self._analysis_exception = thread_exception
-
+            client = self.llm_client
+            logger.debug(f"Sending LLM API request to model: {model_name} via {client.base_url}") # type: ignore
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=messages, # type: ignore # messages is List[ChatCompletionMessageParam]
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            logger.debug(f"Received successful response from LLM API for model {model_name}.")
+            self._llm_completion_object = completion
+        except APIError as e: # Catch specific OpenAI API errors
+            logger.error(f"LLM API call error in thread for model {model_name}: {str(e)}")
+            if hasattr(e, 'response') and e.response and hasattr(e.response, 'text'): # pragma: no cover
+                response_text = e.response.text[:500]
+                status_code_val = e.status_code if hasattr(e, 'status_code') else 'N/A'
+                logger.error(f"Response status: {status_code_val}. Response body snippet: {response_text}")
+            self._llm_api_exception = e
+        except Exception as e: # pragma: no cover
+            logger.error(f"Unexpected error in LLM API call thread for model {model_name}: {str(e)}", exc_info=True)
+            self._llm_api_exception = e
 
     def _save_output(self, content: str, query: str, platforms_analyzed: List[str], format_type: str = "markdown"):
+        """Saves the analysis report to a file."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = self.base_dir / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2496,13 +2589,13 @@ class SocialOSINTLM:
                 for line in header_lines:
                     if ":" in line:
                         key, val = line.split(":", 1)
-                        key = key.strip().lower().replace(" ", "_").replace(":", "") # Sanitize key
-                        val = val.strip()
-                        if key == "query": metadata["query"] = val
-                        elif key == "targets_queried": metadata["platforms_analyzed"] = sorted([p.strip() for p in val.split(",")])
-                        elif key == "report_generated": metadata["timestamp_utc"] = val # Assuming it's UTC parseable
-                        elif key == "text_analysis": metadata["text_model"] = val.strip("`")
-                        elif key == "image_analysis": metadata["image_model"] = val.strip("`")
+                        key_clean = key.strip().lower().replace(" ", "_").replace(":", "") # Sanitize key # Renamed key
+                        val_clean = val.strip() # Renamed val
+                        if key_clean == "query": metadata["query"] = val_clean
+                        elif key_clean == "targets_queried": metadata["platforms_analyzed"] = sorted([p.strip() for p in val_clean.split(",")])
+                        elif key_clean == "report_generated": metadata["timestamp_utc"] = val_clean # Assuming it's UTC parseable
+                        elif key_clean == "text_analysis": metadata["text_model"] = val_clean.strip("`")
+                        elif key_clean == "image_analysis": metadata["image_model"] = val_clean.strip("`")
                 # The actual LLM content starts after the "---"
                 report_content_md = "\n".join(report_lines[content_start_index:]).strip()
         except IndexError: # pragma: no cover (if report is too short)
@@ -2510,6 +2603,7 @@ class SocialOSINTLM:
             report_content_md = content # Use full content as report body
 
         try:
+            filename = None # Initialize filename variable
             if format_type == "json":
                 filename = output_dir / f"{filename_base}.json"
                 data_to_save = {
@@ -2535,8 +2629,8 @@ class SocialOSINTLM:
             self.console.print(f"[bold red]Failed to save output: {str(e)}[/bold red]")
             logger.error(f"Failed to save output file {filename_base}: {e}", exc_info=True)
 
-
     def get_available_platforms(self, check_creds=True) -> List[str]:
+        """Determines which platforms are available based on environment variables."""
         available = []
         # Twitter
         if not check_creds or all(os.getenv(k) for k in ["TWITTER_BEARER_TOKEN"]):
@@ -2563,15 +2657,15 @@ class SocialOSINTLM:
         return sorted(list(set(available))) # Unique and sorted
 
     def run(self): # pragma: no cover
+        """Runs the interactive mode of the analyzer."""
         self.console.print(Panel("[bold blue]SocialOSINTLM[/bold blue]\nCollects and analyzes user activity across multiple platforms using vision and LLMs.\nEnsure API keys and identifiers are set in your `.env` file.", title="Welcome", border_style="blue"))
-        # Initial check for OpenRouter key (critical for analysis)
+        # Initial check for LLM client initialization (critical for analysis)
         try:
-            _ = self.openrouter # Initialize OpenRouter client to check key
+            _ = self.llm_client # Accessing property triggers initialization
         except RuntimeError as core_err:
-            self.console.print(f"[bold red]Critical Configuration Error:[/bold red] {core_err}")
-            self.console.print("Cannot proceed without OpenRouter configuration.")
-            return # Exit if OpenRouter is not configured
-
+            self.console.print(f"[bold red]Critical LLM Configuration Error:[/bold red] {core_err}")
+            self.console.print("Cannot proceed without LLM configuration (LLM_API_KEY, LLM_API_BASE_URL etc.).")
+            return # Exit if LLM is not configured
 
         while True:
             self.console.print("\n[bold cyan]Select Platform(s) for Analysis:[/bold cyan]")
@@ -2595,21 +2689,21 @@ class SocialOSINTLM:
 
             platform_options = {str(i + 1): p for i, p in enumerate(current_available)}
             num_platforms = len(current_available)
-            next_key = num_platforms + 1
+            next_key_val = num_platforms + 1 # Renamed next_key
 
             cross_platform_key = None
             if num_platforms > 1: # Only offer cross-platform if more than one is available
-                cross_platform_key = str(next_key)
+                cross_platform_key = str(next_key_val)
                 platform_options[cross_platform_key] = "cross-platform"
-                next_key += 1
+                next_key_val += 1
             
-            purge_key = str(next_key); platform_options[purge_key] = "purge data"; next_key +=1
-            exit_key = str(next_key); platform_options[exit_key] = "exit"
+            purge_key = str(next_key_val); platform_options[purge_key] = "purge data"; next_key_val +=1
+            exit_key = str(next_key_val); platform_options[exit_key] = "exit"
 
 
-            for key, name in platform_options.items():
-                display_name = name.replace("-", " ").capitalize()
-                self.console.print(f" {key}. {display_name}")
+            for key_opt, name_opt in platform_options.items(): # Renamed key, name
+                display_name_opt = name_opt.replace("-", " ").capitalize() # Renamed display_name
+                self.console.print(f" {key_opt}. {display_name_opt}")
             
             choice = Prompt.ask(f"Enter number(s) (e.g., 1 or 1,3 or {cross_platform_key if cross_platform_key else 'N/A'})", default=exit_key).strip().lower()
 
@@ -2653,62 +2747,62 @@ class SocialOSINTLM:
             platforms_to_query: Dict[str, List[str]] = {}
             abort_selection = False # Flag to break outer loop if needed
             try:
-                for key in selected_platform_keys:
+                for key_sel in selected_platform_keys: # Renamed key
                     if abort_selection: break
-                    if key not in platform_options: continue # Should not happen due to prior validation
-                    platform_name = platform_options[key]
+                    if key_sel not in platform_options: continue # Should not happen due to prior validation
+                    platform_name_sel = platform_options[key_sel] # Renamed platform_name
 
                     # Build prompt message with platform-specific examples/guidance
-                    prompt_message = f"Enter {platform_name.capitalize()} username(s) (comma-separated"
-                    if platform_name == "twitter": prompt_message += ", no '@')"
-                    elif platform_name == "reddit": prompt_message += ", no 'u/')"
-                    elif platform_name == "bluesky": prompt_message += ", e.g., 'handle.bsky.social')"
-                    elif platform_name == "mastodon": prompt_message += ", format: 'user@instance.domain')"
+                    prompt_message = f"Enter {platform_name_sel.capitalize()} username(s) (comma-separated"
+                    if platform_name_sel == "twitter": prompt_message += ", no '@')"
+                    elif platform_name_sel == "reddit": prompt_message += ", no 'u/')"
+                    elif platform_name_sel == "bluesky": prompt_message += ", e.g., 'handle.bsky.social')"
+                    elif platform_name_sel == "mastodon": prompt_message += ", format: 'user@instance.domain')"
                     else: prompt_message += ")" # Covers hackernews and default
                     
                     user_input = Prompt.ask(prompt_message, default="").strip()
                     if not user_input:
-                        self.console.print(f"[yellow]No usernames entered for {platform_name.capitalize()}. Skipping.[/yellow]")
+                        self.console.print(f"[yellow]No usernames entered for {platform_name_sel.capitalize()}. Skipping.[/yellow]")
                         continue
                     
-                    usernames = [u.strip() for u in user_input.split(",") if u.strip()] # Split and strip
-                    if not usernames: # If all inputs were empty or just commas
-                        self.console.print(f"[yellow]No valid usernames provided for {platform_name.capitalize()} after stripping. Skipping.[/yellow]")
+                    usernames_list = [u.strip() for u in user_input.split(",") if u.strip()] # Split and strip # Renamed usernames
+                    if not usernames_list: # If all inputs were empty or just commas
+                        self.console.print(f"[yellow]No valid usernames provided for {platform_name_sel.capitalize()} after stripping. Skipping.[/yellow]")
                         continue
 
                     # Platform-specific validation/normalization
                     validated_users = []
-                    if platform_name == "mastodon":
+                    if platform_name_sel == "mastodon":
                         default_instance_url = os.getenv("MASTODON_API_BASE_URL", "")
                         default_instance_domain = urlparse(default_instance_url).netloc if default_instance_url else None
-                        for u in usernames:
-                            if "@" in u and "." in u.split("@")[1]: # Basic check for user@instance.domain
-                                validated_users.append(u)
+                        for u_val in usernames_list: # Renamed u
+                            if "@" in u_val and "." in u_val.split("@")[1]: # Basic check for user@instance.domain
+                                validated_users.append(u_val)
                             else: # Username lacks instance
                                 if default_instance_domain: # If we have a default from .env
-                                    assumed_user = f"{u}@{default_instance_domain}"
-                                    if Confirm.ask(f"[yellow]Username '{u}' lacks instance. Assume '{assumed_user}' (from .env)?", default=True):
+                                    assumed_user = f"{u_val}@{default_instance_domain}"
+                                    if Confirm.ask(f"[yellow]Username '{u_val}' lacks instance. Assume '{assumed_user}' (from .env)?", default=True):
                                         validated_users.append(assumed_user)
-                                    else: self.console.print(f"[yellow]Skipping Mastodon username '{u}' due to missing instance.[/yellow]")
+                                    else: self.console.print(f"[yellow]Skipping Mastodon username '{u_val}' due to missing instance.[/yellow]")
                                 else: # No default instance, cannot assume
-                                    self.console.print(f"[bold red]Invalid Mastodon username format: '{u}'. Needs 'user@instance.domain'. Cannot assume default. Skipping.[/bold red]")
-                        usernames = validated_users # Update usernames with validated/confirmed ones
-                    elif platform_name == "twitter": usernames = [u.lstrip("@") for u in usernames]; validated_users = usernames
-                    elif platform_name == "reddit": usernames = [u.replace("u/", "").replace("/u/", "") for u in usernames]; validated_users = usernames
-                    else: validated_users = usernames # For Bluesky handle, HackerNews, etc.
+                                    self.console.print(f"[bold red]Invalid Mastodon username format: '{u_val}'. Needs 'user@instance.domain'. Cannot assume default. Skipping.[/bold red]")
+                        usernames_list = validated_users # Update usernames with validated/confirmed ones
+                    elif platform_name_sel == "twitter": usernames_list = [u.lstrip("@") for u in usernames_list]; validated_users = usernames_list
+                    elif platform_name_sel == "reddit": usernames_list = [u.replace("u/", "").replace("/u/", "") for u in usernames_list]; validated_users = usernames_list
+                    else: validated_users = usernames_list # For Bluesky handle, HackerNews, etc.
                     
                     if validated_users:
-                        if platform_name not in platforms_to_query: platforms_to_query[platform_name] = []
+                        if platform_name_sel not in platforms_to_query: platforms_to_query[platform_name_sel] = []
                         # Add only unique usernames per platform
-                        current_users = set(platforms_to_query[platform_name])
+                        current_users = set(platforms_to_query[platform_name_sel])
                         added_count = 0
-                        for user_val in validated_users: # Renamed user to user_val
-                            if user_val not in current_users:
-                                platforms_to_query[platform_name].append(user_val)
-                                current_users.add(user_val)
+                        for user_to_add in validated_users: # Renamed user_val
+                            if user_to_add not in current_users:
+                                platforms_to_query[platform_name_sel].append(user_to_add)
+                                current_users.add(user_to_add)
                                 added_count +=1
-                        if added_count < len(validated_users): logger.debug(f"Excluded {len(validated_users) - added_count} duplicate username(s) for {platform_name}.")
-                    else: logger.warning(f"No valid usernames remained for {platform_name} after validation/confirmation.")
+                        if added_count < len(validated_users): logger.debug(f"Excluded {len(validated_users) - added_count} duplicate username(s) for {platform_name_sel}.")
+                    else: logger.warning(f"No valid usernames remained for {platform_name_sel} after validation/confirmation.")
 
 
                 if not platforms_to_query: # No valid users for any selected platform
@@ -2717,7 +2811,6 @@ class SocialOSINTLM:
 
                 # Initialize clients for selected platforms (catches config issues early)
                 self.console.print("[cyan]Initializing API clients...")
-                init_ok = True
                 
                 # Create a Progress instance specifically for client initialization
                 client_init_progress = Progress(
@@ -2728,22 +2821,22 @@ class SocialOSINTLM:
                     refresh_per_second=10,
                 )
                 with client_init_progress:
-                    init_task = client_init_progress.add_task("Initializing...", total=len(platforms_to_query))
+                    init_task_id = client_init_progress.add_task("Initializing...", total=len(platforms_to_query)) # Renamed init_task
                     for platform_name_iter in list(platforms_to_query.keys()): # Renamed platform_name, iterate over copy of keys
-                        if init_task is not None and init_task in client_init_progress.task_ids:
-                             client_init_progress.update(init_task, description=f"Initializing {platform_name_iter.capitalize()}...")
+                        if init_task_id is not None and init_task_id in client_init_progress.task_ids:
+                             client_init_progress.update(init_task_id, description=f"Initializing {platform_name_iter.capitalize()}...")
                         try:
-                            # Accessing the property will trigger initialization
-                            _ = getattr(self, platform_name_iter) # e.g., self.twitter
+                            # Accessing the property will trigger initialization and validation
+                            if platform_name_iter != "hackernews": # HackerNews has no client to init from self
+                                _ = getattr(self, platform_name_iter) # e.g., self.twitter
                             logger.info(f"{platform_name_iter.capitalize()} client initialized successfully.")
-                        except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError) as client_err:
+                        except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError, OpenAIError) as client_err: # Added OpenAIError
                             self.console.print(f"[bold red]Error initializing {platform_name_iter.capitalize()} client:[/bold red] {client_err}")
                             self.console.print(f"[yellow]Cannot analyze {platform_name_iter.capitalize()}. Check credentials/config and logs.[/yellow]")
                             del platforms_to_query[platform_name_iter] # Remove from this round
-                            init_ok = False # Flag that at least one client failed
                         finally:
-                            if init_task is not None and init_task in client_init_progress.task_ids:
-                                client_init_progress.advance(init_task)
+                            if init_task_id is not None and init_task_id in client_init_progress.task_ids:
+                                client_init_progress.advance(init_task_id)
                 
                 if not platforms_to_query: # If all selected platforms failed client init
                     self.console.print("[bold red]No clients could be initialized successfully. Returning to menu.[/bold red]")
@@ -2763,25 +2856,26 @@ class SocialOSINTLM:
                 else: abort_selection = True; break
             if abort_selection: break # Break from main while True if exit confirmed
 
-        self.console.print("\n[blue]Exiting Social Media analyzer.[/blue]")
+        self.console.print("\n[blue]Exiting SocialOSINTLM analyzer.[/blue]")
 
     def _run_analysis_loop(self, platforms: Dict[str, List[str]]): # pragma: no cover
+        """Runs the analysis query loop after platforms and users are selected."""
         # Prepare display string for current targets
         platform_labels = []
         platform_names_list = sorted(platforms.keys()) # For saving output
-        for pf, users in platforms.items():
+        for pf, users_list in platforms.items(): # Renamed users
             display_users_list = []
             user_prefix = ""
             if pf == "twitter": user_prefix = "@"
             elif pf == "reddit": user_prefix = "u/"
             # Mastodon/Bluesky/HN handles are usually complete
-            for u in users: display_users_list.append(f"{user_prefix}{u}" if user_prefix else u)
+            for u_item in users_list: display_users_list.append(f"{user_prefix}{u_item}" if user_prefix else u_item) # Renamed u
             platform_labels.append(f"{pf.capitalize()}: {', '.join(display_users_list)}")
         platform_info = " | ".join(platform_labels)
         current_targets_str = f"Targets: {platform_info}"
 
         self.console.print(Panel(f"{current_targets_str}\nEnter your analysis query below.\nCommands: `exit` (return to menu), `refresh` (force full data fetch), `help`", title="🔎 Analysis Session", border_style="cyan", expand=False))
-        last_query = ""
+        last_query = "" # Store the last successful query
 
         while True:
             try:
@@ -2797,11 +2891,13 @@ class SocialOSINTLM:
                     self.console.print(Panel("**Available Commands:**\n- `exit`: Return to the platform selection menu.\n- `refresh`: Force a full data fetch for all current targets, ignoring cache.\n- `help`: Show this help message.\n\n**To analyze:**\nSimply type your analysis question (e.g., 'What are the main topics discussed?', 'Identify potential location clues from images and text.')\nPressing Enter with no input repeats the last query.", title="Help", border_style="blue", expand=False))
                     continue
                 if cmd == "refresh":
+                    # Confirm before forcing refresh as it uses more API calls
                     if Confirm.ask("Force refresh data for all current targets? This ignores cache and uses more API calls.", default=False):
-                        total_targets_refresh = sum(len(u_list) for u_list in platforms.values()) # Corrected to u_list
+                        total_targets_refresh = sum(len(u_list_ref) for u_list_ref in platforms.values()) # Corrected to u_list # Renamed u_list
                         failed_refreshes = []
                         
-                        refresh_progress = Progress( # New Progress instance for refresh
+                        # Create a Progress instance specifically for refresh
+                        refresh_progress = Progress(
                             SpinnerColumn(),
                             "[progress.description]{task.description}",
                             transient=True,
@@ -2809,31 +2905,31 @@ class SocialOSINTLM:
                             refresh_per_second=10,
                         )
                         with refresh_progress:
-                            refresh_task = refresh_progress.add_task("[yellow]Refreshing data...", total=total_targets_refresh)
-                            for platform, usernames in platforms.items():
-                                fetcher = getattr(self, f"fetch_{platform}", None)
-                                if not fetcher: continue # Should not happen if platform is in `platforms`
-                                for username in usernames:
-                                    display_name = username # Simple display for progress
-                                    if platform == "twitter": display_name = f"@{username}"
-                                    elif platform == "reddit": display_name = f"u/{username}"
+                            refresh_task_id = refresh_progress.add_task("[yellow]Refreshing data...", total=total_targets_refresh) # Renamed refresh_task
+                            for platform_ref, usernames_ref in platforms.items(): # Renamed platform, usernames
+                                fetcher_ref = getattr(self, f"fetch_{platform_ref}", None) # Renamed fetcher
+                                if not fetcher_ref: continue # Should not happen if platform is in `platforms`
+                                for username_ref in usernames_ref: # Renamed username
+                                    display_name_ref = username_ref # Simple display for progress # Renamed display_name
+                                    if platform_ref == "twitter": display_name_ref = f"@{username_ref}"
+                                    elif platform_ref == "reddit": display_name_ref = f"u/{username_ref}"
                                     
-                                    if refresh_task is not None and refresh_task in refresh_progress.task_ids:
-                                        refresh_progress.update(refresh_task, description=f"[yellow]Refreshing {platform}/{display_name}...")
+                                    if refresh_task_id is not None and refresh_task_id in refresh_progress.task_ids:
+                                        refresh_progress.update(refresh_task_id, description=f"[yellow]Refreshing {platform_ref}/{display_name_ref}...")
                                     try:
-                                        result = fetcher(username=username, force_refresh=True)
+                                        result = fetcher_ref(username=username_ref, force_refresh=True)
                                         if result is None: # Fetcher indicated failure, already logged by fetcher
                                             # Add to local list if not already (e.g. from specific exceptions)
-                                            if not any(f[0] == platform and f[1] == display_name for f in failed_refreshes):
-                                                failed_refreshes.append((platform, display_name))
-                                    except Exception as e: # Catch-all for unexpected issues during forced refresh
-                                        logger.error(f"Unexpected error during refresh for {platform}/{display_name}: {e}", exc_info=True)
-                                        self.console.print(f"[red]Unexpected Refresh failed for {platform}/{display_name}: {e}[/red]")
-                                        if not any(f[0] == platform and f[1] == display_name for f in failed_refreshes):
-                                             failed_refreshes.append((platform, display_name))
+                                            if not any(f[0] == platform_ref and f[1] == display_name_ref for f in failed_refreshes):
+                                                failed_refreshes.append((platform_ref, display_name_ref))
+                                    except Exception as e_ref: # Catch-all for unexpected issues during forced refresh # Renamed e
+                                        logger.error(f"Unexpected error during refresh for {platform_ref}/{display_name_ref}: {e_ref}", exc_info=True)
+                                        self.console.print(f"[red]Unexpected Refresh failed for {platform_ref}/{display_name_ref}: {e_ref}[/red]")
+                                        if not any(f[0] == platform_ref and f[1] == display_name_ref for f in failed_refreshes):
+                                             failed_refreshes.append((platform_ref, display_name_ref))
                                     finally:
-                                        if refresh_task is not None and refresh_task in refresh_progress.task_ids:
-                                             refresh_progress.advance(refresh_task)
+                                        if refresh_task_id is not None and refresh_task_id in refresh_progress.task_ids:
+                                             refresh_progress.advance(refresh_task_id)
                         if failed_refreshes: self.console.print(f"[yellow]Data refresh attempted, but issues encountered for {len(failed_refreshes)} target(s) (see logs/previous messages).[/yellow]")
                         else: self.console.print("[green]Data refresh attempt completed for all targets.[/green]")
                     continue # Back to query prompt
@@ -2843,6 +2939,7 @@ class SocialOSINTLM:
                 analysis_result = self.analyze(platforms, query)
 
                 if analysis_result:
+                    # Check if the result is an error/warning message string or a report
                     result_lower_stripped = analysis_result.strip().lower()
                     is_error = any(result_lower_stripped.startswith(prefix) for prefix in ["[red]", "error:", "analysis failed", "analysis aborted"])
                     is_warning = result_lower_stripped.startswith("[yellow]") or result_lower_stripped.startswith("warning:")
@@ -2856,6 +2953,7 @@ class SocialOSINTLM:
                         # For actual LLM-generated Markdown reports
                         content_to_render = Markdown(analysis_result)
                     
+                    # Display the report in a panel
                     self.console.print(Panel(content_to_render, title="Analysis Report", border_style=border_col, expand=False, title_align="left"))
 
                     if not is_error: # Only offer to save non-error reports
@@ -2882,19 +2980,19 @@ class SocialOSINTLM:
                 self.console.print("\n[yellow]Analysis query cancelled.[/yellow]")
                 if Confirm.ask("\nExit this analysis session (return to menu)?", default=False): break
                 else: last_query = ""; continue # Clear last query and restart loop
-            except RateLimitExceededError as rle: # Should be caught by analyze, but defensive
+            except RateLimitExceededError: # Should be caught by analyze, but defensive
                  self.console.print("[yellow]A rate limit was hit during analysis. Please wait before trying again.[/yellow]")
-            except RuntimeError as e:
-                logger.error(f"Runtime error during analysis query processing: {e}", exc_info=True)
-                self.console.print(f"\n[bold red]An error occurred during analysis:[/bold red] {e}")
+            except RuntimeError as e_run: # From API call failure or other programmatic issues # Renamed e
+                logger.error(f"Runtime error during analysis query processing: {e_run}", exc_info=True)
+                self.console.print(f"\n[bold red]An error occurred during analysis:[/bold red] {e_run}")
                 self.console.print("[yellow]Check logs for details. You can try again or exit.[/yellow]")
-            except Exception as e:
-                logger.error(f"Unexpected error during analysis loop: {e}", exc_info=True)
-                self.console.print(f"\n[bold red]An unexpected error occurred:[/bold red] {e}")
+            except Exception as e_exc: # Unexpected error during analysis loop # Renamed e
+                logger.error(f"Unexpected error during analysis loop: {e_exc}", exc_info=True)
+                self.console.print(f"\n[bold red]An unexpected error occurred:[/bold red] {e_exc}")
                 if not Confirm.ask("An error occurred. Continue session?", default=True): break
 
-
     def process_stdin(self): # pragma: no cover
+        """Processes a single analysis request received via stdin."""
         stderr_console = Console(stderr=True) # For messages not part of report
         stderr_console.print("[cyan]Processing analysis request from stdin...[/cyan]")
 
@@ -2917,48 +3015,48 @@ class SocialOSINTLM:
             available_configured = self.get_available_platforms(check_creds=True)
             available_conceptual = self.get_available_platforms(check_creds=False) # All platforms tool knows
 
-            for platform, usernames in platforms_in.items():
-                platform = platform.lower() # Normalize platform name
-                if platform not in available_conceptual:
-                    logger.warning(f"Platform '{platform}' specified in stdin is not supported by this tool. Skipping.")
+            for platform_key, usernames_val in platforms_in.items(): # Renamed platform, usernames
+                platform_key_lower = platform_key.lower() # Normalize platform name # Renamed platform
+                if platform_key_lower not in available_conceptual:
+                    logger.warning(f"Platform '{platform_key_lower}' specified in stdin is not supported by this tool. Skipping.")
                     continue
                 
                 # Check if platform requires config and if it's configured
-                requires_config = platform != "hackernews" # HN needs no special config
-                if requires_config and platform not in available_configured:
-                    logger.warning(f"Platform '{platform}' specified in stdin requires configuration, but credentials/setup seem missing or invalid. Skipping.")
+                requires_config = platform_key_lower != "hackernews" # HN needs no special config
+                if requires_config and platform_key_lower not in available_configured:
+                    logger.warning(f"Platform '{platform_key_lower}' specified in stdin requires configuration, but credentials/setup seem missing or invalid. Skipping.")
                     continue
 
                 # Process usernames (string or list)
                 processed_users = []
-                if isinstance(usernames, str):
-                    if usernames.strip(): processed_users = [usernames.strip()]
-                elif isinstance(usernames, list):
-                    processed_users = [u.strip() for u in usernames if isinstance(u, str) and u.strip()]
+                if isinstance(usernames_val, str):
+                    if usernames_val.strip(): processed_users = [usernames_val.strip()]
+                elif isinstance(usernames_val, list):
+                    processed_users = [u.strip() for u in usernames_val if isinstance(u, str) and u.strip()]
                 else:
-                    logger.warning(f"Invalid username format for platform '{platform}' in stdin. Expected string or list of strings. Skipping platform.")
+                    logger.warning(f"Invalid username format for platform '{platform_key_lower}' in stdin. Expected string or list of strings. Skipping platform.")
                     continue
                 
                 if not processed_users:
-                    logger.warning(f"No valid usernames provided for platform '{platform}' in stdin. Skipping platform.")
+                    logger.warning(f"No valid usernames provided for platform '{platform_key_lower}' in stdin. Skipping platform.")
                     continue
 
                 # Validate/normalize usernames per platform
                 validated_users_for_platform = []
-                if platform == "mastodon":
-                    for u in processed_users:
-                        if "@" in u and "." in u.split("@")[1]: validated_users_for_platform.append(u)
-                        else: logger.warning(f"Invalid Mastodon username format in stdin for '{u}'. Needs 'user@instance.domain'. Skipping user.")
-                elif platform == "twitter": validated_users_for_platform = [u.lstrip("@") for u in processed_users]
-                elif platform == "reddit": validated_users_for_platform = [u.replace("u/", "").replace("/u/", "") for u in processed_users]
+                if platform_key_lower == "mastodon":
+                    for u_mast in processed_users: # Renamed u
+                        if "@" in u_mast and "." in u_mast.split("@")[1]: validated_users_for_platform.append(u_mast)
+                        else: logger.warning(f"Invalid Mastodon username format in stdin for '{u_mast}'. Needs 'user@instance.domain'. Skipping user.")
+                elif platform_key_lower == "twitter": validated_users_for_platform = [u.lstrip("@") for u in processed_users]
+                elif platform_key_lower == "reddit": validated_users_for_platform = [u.replace("u/", "").replace("/u/", "") for u in processed_users]
                 else: validated_users_for_platform = processed_users # Bluesky, HackerNews
 
                 if not validated_users_for_platform:
-                    logger.warning(f"No valid usernames remained for platform '{platform}' after validation. Skipping platform.")
+                    logger.warning(f"No valid usernames remained for platform '{platform_key_lower}' after validation. Skipping platform.")
                     continue
 
                 if validated_users_for_platform:
-                    valid_platforms_to_analyze[platform] = sorted(list(set(validated_users_for_platform))) # Store unique, sorted
+                    valid_platforms_to_analyze[platform_key_lower] = sorted(list(set(validated_users_for_platform))) # Store unique, sorted
 
             if not valid_platforms_to_analyze:
                 raise ValueError("No valid and configured platforms with valid usernames found in the processed input.")
@@ -2966,17 +3064,17 @@ class SocialOSINTLM:
             # Initialize clients for requested platforms
             logger.info("Initializing API clients for stdin request...")
             platforms_failed_init = []
-            for platform_name_iter in list(valid_platforms_to_analyze.keys()): # Renamed platform_name
-                if platform_name_iter == "hackernews": # No client to init for HN
+            for platform_name_init in list(valid_platforms_to_analyze.keys()): # Renamed platform_name_iter
+                if platform_name_init == "hackernews": # No client to init for HN
                     logger.info("HackerNews requires no specific client initialization.")
                     continue
                 try:
-                    _ = getattr(self, platform_name_iter) # Trigger client init
-                    logger.info(f"{platform_name_iter.capitalize()} client initialized successfully for stdin.")
-                except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError) as client_err:
-                    logger.error(f"Error initializing {platform_name_iter.capitalize()} client for stdin: {client_err}")
-                    del valid_platforms_to_analyze[platform_name_iter] # Remove if client fails
-                    platforms_failed_init.append(platform_name_iter)
+                    _ = getattr(self, platform_name_init) # Trigger client init
+                    logger.info(f"{platform_name_init.capitalize()} client initialized successfully for stdin.")
+                except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError, OpenAIError) as client_err: # Added OpenAIError
+                    logger.error(f"Error initializing {platform_name_init.capitalize()} client for stdin: {client_err}")
+                    del valid_platforms_to_analyze[platform_name_init] # Remove if client fails
+                    platforms_failed_init.append(platform_name_init)
             
             if not valid_platforms_to_analyze and not platforms_failed_init: pass # This means no platforms were requested that needed init
             elif not valid_platforms_to_analyze : # All platforms that needed init failed
@@ -2997,16 +3095,16 @@ class SocialOSINTLM:
             is_error_report = any(result_lower_stripped.startswith(prefix) for prefix in ["[red]", "error:", "analysis failed", "analysis aborted"])
 
             if not is_error_report:
-                platform_names_list = sorted(valid_platforms_to_analyze.keys())
+                platform_names_list_save = sorted(valid_platforms_to_analyze.keys()) # Renamed platform_names_list
                 no_auto_save_flag = getattr(self.args, "no_auto_save", False)
                 output_format = getattr(self.args, "format", "markdown")
 
                 if no_auto_save_flag: # Print to stdout if no-auto-save
                     print(analysis_report) # Print the raw report (could be markdown with Rich tags)
                     logger.info("Analysis complete. Report printed to stdout (--no-auto-save).")
-                    sys.exit(0)
+                    sys.exit(0) # Success
                 else: # Auto-save enabled
-                    self._save_output(analysis_report, query, platform_names_list, output_format)
+                    self._save_output(analysis_report, query, platform_names_list_save, output_format)
                     stderr_console.print(f"[green]Analysis complete. Output auto-saved ({output_format}).[/green]")
                     sys.exit(0) # Success
             else: # The report from analyze() was an error message
@@ -3015,14 +3113,14 @@ class SocialOSINTLM:
                 logger.error(f"Analysis via stdin completed but generated an error report. Query: '{query}'")
                 sys.exit(2) # Indicate error completion
 
-        except (json.JSONDecodeError, ValueError, RuntimeError) as e:
-            logger.error(f"Error processing stdin request: {e}", exc_info=False) # No full stack for these expected errors
-            sys.stderr.write(f"Error: {e}\n")
-            sys.exit(1)
-        except Exception as e: # Unexpected critical errors
-            logger.critical(f"Unexpected critical error during stdin processing: {e}", exc_info=True)
-            sys.stderr.write(f"Critical Error: An unexpected error occurred - {e}\n")
-            sys.exit(1)
+        except (json.JSONDecodeError, ValueError, RuntimeError) as e_proc: # Catch specific processing errors # Renamed e
+            logger.error(f"Error processing stdin request: {e_proc}", exc_info=False) # No full stack for these expected errors
+            sys.stderr.write(f"Error: {e_proc}\n")
+            sys.exit(1) # Indicate input/processing error
+        except Exception as e_crit: # Unexpected critical errors during stdin processing # Renamed e
+            logger.critical(f"Unexpected critical error during stdin processing: {e_crit}", exc_info=True)
+            sys.stderr.write(f"Critical Error: An unexpected error occurred - {e_crit}\n")
+            sys.exit(1) # Indicate critical failure
 
 
 if __name__ == "__main__": # pragma: no cover
@@ -3030,10 +3128,26 @@ if __name__ == "__main__": # pragma: no cover
         description="Social Media OSINT analyzer using LLMs. Fetches user data from various platforms, performs text and image analysis, and generates reports.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
-Environment Variables Required:
-  OPENROUTER_API_KEY      : Your OpenRouter.ai API key.
-  IMAGE_ANALYSIS_MODEL    : Vision model on OpenRouter (e.g., google/gemini-pro-vision).
-  ANALYSIS_MODEL          : Text model on OpenRouter (e.g., mistralai/mixtral-8x7b-instruct).
+Environment Variables Required for LLM (using OpenAI-compatible API):
+  LLM_API_KEY             : API key for your chosen LLM provider.
+                            (e.g., OpenRouter key if using OpenRouter, your OpenAI key, 
+                             or a specific key/placeholder like "NULL" for some self-hosted models).
+  LLM_API_BASE_URL        : Base URL for the LLM API endpoint.
+                            (e.g., https://openrouter.ai/api/v1 for OpenRouter,
+                             https://api.openai.com/v1 for OpenAI,
+                             or http://localhost:8000/v1 for a local OpenAI-compatible server).
+  IMAGE_ANALYSIS_MODEL    : Vision model name recognized by your LLM provider/endpoint.
+                            (e.g., openai/gpt-4o, google/gemini-pro-vision for OpenRouter, 
+                             gpt-4-vision-preview for OpenAI, or model ID for self-hosted).
+  ANALYSIS_MODEL          : Text model name recognized by your LLM provider/endpoint.
+                            (e.g., mistralai/mixtral-8x7b-instruct for OpenRouter, 
+                             gpt-4-turbo for OpenAI, or model ID for self-hosted).
+
+Optional for OpenRouter (if LLM_API_BASE_URL points to OpenRouter):
+  OPENROUTER_REFERER      : Your site URL or app name for OpenRouter's `HTTP-Referer` header. (Default: http://localhost:3000)
+                            (Example: https://my-app.com)
+  OPENROUTER_X_TITLE      : Your project name for OpenRouter's `X-Title` header. (Default: SocialOSINTLM)
+                            (Example: My OSINT Project)
 
 Platform Credentials (at least one set required, or just use HackerNews):
   TWITTER_BEARER_TOKEN    : Twitter API v2 Bearer Token.
@@ -3070,17 +3184,17 @@ Place these in a `.env` file in the same directory or set them in your environme
             analyzer_instance.process_stdin()
         else:
             analyzer_instance.run()
-    except RuntimeError as e: # Catch critical init errors from SocialOSINTLM constructor
-        logging.getLogger("SocialOSINTLM").critical(f"Initialization failed: {e}", exc_info=False) # No stack for this known type
+    except RuntimeError as e_main_run: # Catch critical init errors from SocialOSINTLM constructor # Renamed e
+        logging.getLogger("SocialOSINTLM").critical(f"Initialization or Configuration failed: {e_main_run}", exc_info=False) # No stack for this known type
         # Use a simple console for this critical error as Rich might not be fully set up or part of issue
         error_console = Console(stderr=True, style="bold red")
-        error_console.print(f"\nCRITICAL ERROR: {e}")
-        error_console.print("Ensure necessary API keys (OpenRouter) and platform credentials/URLs are correctly set in .env or environment.")
+        error_console.print(f"\nCRITICAL ERROR: {e_main_run}")
+        error_console.print("Ensure necessary API keys (LLM_API_KEY, LLM_API_BASE_URL) and platform credentials/URLs are correctly set in .env or environment.")
         error_console.print("Check analyzer.log for more details.")
         sys.exit(1)
-    except Exception as e: # Catch any other unexpected critical errors during startup
-        logging.getLogger("SocialOSINTLM").critical(f"An unexpected critical error occurred: {e}", exc_info=True)
+    except Exception as e_main_crit: # Catch any other unexpected critical errors during startup # Renamed e
+        logging.getLogger("SocialOSINTLM").critical(f"An unexpected critical error occurred: {e_main_crit}", exc_info=True)
         error_console = Console(stderr=True, style="bold red")
-        error_console.print(f"\nUNEXPECTED CRITICAL ERROR: {e}")
+        error_console.print(f"\nUNEXPECTED CRITICAL ERROR: {e_main_crit}")
         error_console.print("Check analyzer.log for the full traceback.")
         sys.exit(1)
