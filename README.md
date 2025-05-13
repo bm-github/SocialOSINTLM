@@ -12,7 +12,7 @@
 
 ✅ **Vision-Capable Image Analysis:** analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
 
-✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1024x1024) for analysis
+✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1536x1536 recommended for many models) for analysis before analysis
 
 ✅ **Cross-Account Comparison:** analyze profiles across multiple selected platforms simultaneously
 
@@ -20,11 +20,13 @@
 
 ✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyzes. Media files are cached in `data/media/`
 
+✅ **Offline Mode (`--offline`):** Run analysis using only locally cached data, ignores cache limit, skipping all external network requests (social platforms, media downloads, *new* vision analysis).
+
 ✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
 
 ✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`)
 
-✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 30 tweets, 20 Reddit submissions, 30 Reddit comments, 50 HN items, ~300 Bluesky posts) to balance depth and API usage
+✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 50 tweets, 50 Reddit submissions, 50 Reddit comments, 50 HN items, ~40 Mastodon/Bluesky posts per API call) to balance depth and API usage. Note: Incremental fetches are typically 50, initial fetches can be more.
 
 ✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`
 
@@ -158,6 +160,8 @@ flowchart TD
     class A,AA,B defaultClass
 ```
 
+*Flowchart Description Note:* In **Offline Mode (`--offline`)**, the "Fetch Platform Data" step and the "Download Media File" step within the Media Analysis Pipeline are *bypassed* if the data/media is not already in the cache. Analysis proceeds only with available cached information.
+
 ## 🛠 Installation
 
 ### Prerequisites
@@ -223,6 +227,10 @@ Run the script without arguments to start the interactive CLI session:
 ```bash
 python socialosintlm.py
 ```
+Add the `--offline` flag to run the session using only cached data:
+```bash
+python socialosintlm.py --offline
+```
 1.  You'll be prompted to select platform(s).
 2.  Enter the username(s) for each selected platform (comma-separated if multiple).
     *   **Twitter:** Usernames *without* the leading `@`.
@@ -232,10 +240,11 @@ python socialosintlm.py
     *   **Mastodon:** Full handles in `user@instance.domain` format. If instance is missing, it may prompt to use the instance from `MASTODON_API_BASE_URL`.
 3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "analyze recent activity patterns", "Identify key interests", "Assess communication style").
 4.  **Commands within the analysis loop:**
-    *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data.
+    *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data. **Note: This command is disabled in offline mode (`--offline`).**
     *   `help`: Displays available commands.
     *   `exit`: Exits the current analysis session and returns to the platform selection menu.
     *   Press `Ctrl+C` to potentially exit the program (will prompt for confirmation).
+5.  **Offline Mode Behavior:** In offline mode, the tool will only load data from the local cache (`data/cache/`). If no cache exists for a requested user/platform, analysis for that target will be skipped (a warning will be shown). No new data is fetched from social platforms, and *no new media is downloaded or analyzed*.
 
 ### Programmatic Mode (via Stdin)
 Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing.
@@ -252,6 +261,17 @@ Provide input as a JSON object via standard input using the `--stdin` flag. This
         "query": "Analyze communication style and main topics."
         }' | python socialosintlm.py --stdin
 ```
+Combine with `--offline` to use only cached data:
+```bash
+        echo '{
+        "platforms": {
+        "twitter": ["user1", "user2"],
+        "reddit": ["user3"]
+        },
+        "query": "Summarize cached activity."
+        }' | python socialosintlm.py --stdin --offline
+```
+When using `--stdin --offline`, only cached data will be used. If a platform/user has no cache entry, it will be skipped. The tool will exit with a non-zero status code if *no* data could be loaded for *any* requested target due to missing cache entries.
 
 ### Command-line Arguments
 *   `--stdin`: Read analysis configuration from standard input as a JSON object.
@@ -260,18 +280,21 @@ Provide input as a JSON object via standard input using the `--stdin` flag. This
     *   In interactive mode: Prompts the user whether to save the report and in which format.
     *   In stdin mode: Prints the report directly to standard output instead of saving to a file.
 *   `--log-level [DEBUG|INFO|WARNING|ERROR|CRITICAL]`: Set the logging level (default: `WARNING`).
+*   `--offline`: Run in offline mode. Uses only cached data, no new API calls to social platforms or for new media downloads/vision model analysis.
 
 ## ⚡ Cache System
 *   **Text/API Data:** Fetched platform data is cached for **24 hours** in `data/cache/` as JSON files (`{platform}_{username}.json`). This minimizes redundant API calls.
 *   **Media Files:** Downloaded images and media are stored in `data/media/` using hashed filenames (`{url_hash}.media` with actual extension). These are not automatically purged by the 24-hour cache expiry but are reused if the same URL is encountered.
-*   Use the `refresh` command in interactive mode to force a bypass of the cache for the current session.
+*   In **Offline Mode (`--offline`)**, new data is *not* fetched, and the cache files are *not* updated or extended. The tool relies purely on the existing cache contents. New media files are *not* downloaded.
+*   Use the `refresh` command in interactive mode (online mode only) to force a bypass of the cache for the current session.
 *   Use the "Purge Data" option in the main menu to clear cache, media, or output reports.
 
 ## 🔍 Error Handling & Logging
-*   **Rate Limits:** Detects API rate limits. For Twitter and some LLM providers, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally.
-*   **API Errors:** Handles common platform-specific errors (e.g., user not found, forbidden access, general request issues).
+*   **Rate Limits:** Detects API rate limits. For Twitter and some LLM providers, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally. **Note:** Rate limit handling is bypassed in offline mode as no API calls are made.
+*   **API Errors:** Handles common platform-specific errors (e.g., user not found, forbidden access, general request issues) during online fetching. **Note:** These errors are avoided in offline mode as fetching is skipped.
 *   **LLM API Errors:** Handles errors from the LLM API (e.g., authentication, rate limits, bad requests), providing informative messages.
-*   **Media Download Errors:** Logs issues during media download or processing.
+*   **Media Download Errors:** Logs issues during media download or processing (online mode only).
+*   **Offline Mode Specifics:** In offline mode, if cache is missing for a requested target, a warning is logged and the target is skipped for analysis. No errors related to network connectivity or API issues will occur.
 *   **Logging:** Detailed errors and warnings are logged to `analyzer.log`. The log level can be configured using the `--log-level` argument.
 
 ## 🤖 AI Analysis Details
@@ -279,25 +302,24 @@ Provide input as a JSON object via standard input using the `--stdin` flag. This
     *   Uses the model specified by `ANALYSIS_MODEL` via the configured `LLM_API_BASE_URL`.
     *   Receives **formatted summaries** of fetched data (user info, stats, recent post/comment text snippets, media presence indicators) per platform, *not* raw API dumps.
     *   Guided by a detailed **system prompt** focusing on objective, evidence-based analysis across domains: Behavioral Patterns, Semantic Content, Interests/Network, Communication Style.
+    *   **Offline Mode Impact:** The LLM is informed via the system prompt that it is running in offline mode and analysis is based *only* on potentially stale cached data. It will not have access to real-time or newly generated data.
 *   **Image Analysis:**
     *   Uses the vision-capable model specified by `IMAGE_ANALYSIS_MODEL` via the configured `LLM_API_BASE_URL`.
     *   Images larger than 1536x1536 are resized before analysis. Animated GIFs use their first frame. Images are converted to a common format (e.g., JPEG) if necessary.
     *   Guided by a specific **prompt** requesting objective identification of key OSINT-relevant elements (setting, objects, people details, text, activity, overall theme). Avoids speculation.
-*   **Integration:** The final text analysis incorporates insights derived from both the formatted text data summaries and the individual image analysis reports.
+    *   **Offline Mode Impact:** Image analysis is **only performed if the image file was already downloaded and cached** in a previous online run. New media linked in cached posts will *not* be downloaded or analyzed visually when `--offline` is used. The LLM is aware that visual context may be missing for some data points.
+*   **Integration:** The final text analysis incorporates insights derived from both the formatted text data summaries and the individual image analysis reports *that were available from the cache*.
 
 ## 📸 Media Processing Details
-*   Downloads media files (images: `JPEG, PNG, GIF, WEBP`; some videos might be downloaded but not analyzed visually by default) linked in posts/tweets.
+*   Downloads media files (images: `JPEG, PNG, GIF, WEBP`; some videos might be downloaded but not analyzed visually by default) linked in posts/tweets. **Note:** This step is skipped in Offline Mode (`--offline`) if the media is not already cached.
 *   Stores files locally in `data/media/`.
-*   Handles platform-specific access:
-    *   Twitter: Uses Bearer Token for potential private media access (though typically public URLs).
-    *   Bluesky: Constructs authenticated CDN URLs (`cdn.bsky.app`) using the user's DID, image CID, and the session's access token.
-    *   Reddit: Handles direct image links and images within Reddit Galleries (`media_metadata`).
-*   Analyzes valid downloaded images using the vision LLM.
+*   Handles platform-specific access during download (online mode).
+*   Analyzes valid downloaded images using the vision LLM. **Note:** This step is skipped in Offline Mode if the image file is not in the local cache.
 
 ## 🔒 Security Considerations
-*   **API Keys:** Requires potentially sensitive API keys and secrets (e.g., `LLM_API_KEY`, platform tokens) stored as environment variables or in a `.env` file. Ensure this file is secured and added to `.gitignore`.
-*   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analyzed and secure the directory appropriately.
-*   **Terms of Service:** Ensure your use of the tool complies with the Terms of Service of each social media platform and your chosen LLM API provider. Automated querying can be subject to restrictions.
+*   **API Keys:** Requires potentially sensitive API keys and secrets (e.g., `LLM_API_KEY`, platform tokens) stored as environment variables or in a `.env` file. Ensure this file is secured and added to `.gitignore`. LLM keys/URLs are still needed even in offline mode as the analysis itself is performed by the LLM (unless you hypothetically ran the LLM elsewhere and only used the tool for data collection).
+*   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analyzed and secure the directory appropriately. **In offline mode, this cache is the *only* data source.**
+*   **Terms of Service:** Ensure your use of the tool complies with the Terms of Service of each social media platform and your chosen LLM API provider. Automated querying can be subject to restrictions. Using offline mode may mitigate some ToS concerns related to excessive querying, but does not negate ToS related to data storage or analysis.
 
 ## 🤝 Contributing
 Contributions are welcome! Please feel free to submit pull requests, report issues, or suggest enhancements via the project's issue tracker.

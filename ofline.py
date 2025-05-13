@@ -884,7 +884,7 @@ class SocialOSINTLM:
             logger.error(f"Image processing error for {file_path}: {str(img_err)}")
             return None
         except APIError as api_err: # Generic OpenAI API error
-            model_used = os.getenv("IMAGE_ANALYSIS_MODEL")
+            model_used = os.getenv("IMAGE_ANALYSIS_MODEL", "Unknown Model")
             err_message = str(api_err)
             status_code = api_err.status_code if hasattr(api_err, 'status_code') else "N/A"
             logger.error(f"LLM API error during image analysis ({model_used}). Status: {status_code}. Error: {err_message}")
@@ -1256,114 +1256,85 @@ class SocialOSINTLM:
         existing_comments = []
         existing_media_analysis = []
         existing_media_paths = []
-        cached_profile_info = None # Will hold profile from cache if available
+
 
         if not force_refresh and cached_data: # Stale cache exists
             logger.info(f"Attempting incremental fetch for Reddit u/{username}")
             existing_submissions = cached_data.get("submissions", [])
             existing_comments = cached_data.get("comments", [])
             if existing_submissions: # Assumed sorted
+                # existing_submissions.sort(key=lambda x: get_sort_key(x, "created_utc"), reverse=True)
                 latest_submission_fullname = existing_submissions[0].get("fullname")
                 if latest_submission_fullname: logger.debug(f"Using latest submission fullname: {latest_submission_fullname}")
             if existing_comments: # Assumed sorted
+                # existing_comments.sort(key=lambda x: get_sort_key(x, "created_utc"), reverse=True)
                 latest_comment_fullname = existing_comments[0].get("fullname")
                 if latest_comment_fullname: logger.debug(f"Using latest comment fullname: {latest_comment_fullname}")
-            
-            cached_profile_info = cached_data.get("user_profile") # Load profile from cache
             existing_media_analysis = cached_data.get("media_analysis", [])
             existing_media_paths = cached_data.get("media_paths", [])
 
-        redditor_info: Dict[str, Any] = {} # This will hold the profile info for the current operation
-
         try:
             reddit_client = self.reddit
-            redditor_praw_obj = reddit_client.redditor(username) # Get the PRAW Redditor object
+            redditor = reddit_client.redditor(username)
+            redditor_info = {} # Store profile info here
+            try: # Check if user exists and get basic info
+                if not self.args.offline or force_refresh or not profile_info: # Added self.args.offline check here
+                     redditor_id = redditor.id # Accessing .id will make a request if not cached by PRAW
+                     redditor_created_utc = redditor.created_utc
+                logger.debug(f"Reddit user u/{username} found (ID: {redditor_id}). Created: {datetime.fromtimestamp(redditor_created_utc, tz=timezone.utc)}")
+                # Store more profile info
+                redditor_info = {
+                    "id": redditor_id, "name": redditor.name,
+                    "created_utc": datetime.fromtimestamp(redditor_created_utc, tz=timezone.utc).isoformat(),
+                    "link_karma": getattr(redditor, "link_karma", 0),
+                    "comment_karma": getattr(redditor, "comment_karma", 0),
+                    "icon_img": getattr(redditor, "icon_img", None),
+                    "is_suspended": getattr(redditor, "is_suspended", False) # Important for context
+                }
+                if redditor_info["is_suspended"]: logger.warning(f"Reddit user u/{username} is suspended.")
+                elif self.args.offline and not profile_info: # If offline and no profile_info in cache
+                     logger.warning(f"Offline mode: No cached profile info found for Reddit u/{username}. Skipping profile details.")
+                     # redditor_info remains empty or None, as initialized before the if
+                else: # Online, not force_refresh, profile_info exists in cache - keep the cached info
+                     logger.debug(f"Using cached profile info for Reddit u/{username}.")
+                     # redditor_info already loaded from cached_data
 
-            # Determine if we need to fetch live profile data
-            should_fetch_live_profile = True
+            except prawcore.exceptions.NotFound:
+                raise UserNotFoundError(f"Reddit user u/{username} not found.")
+            except prawcore.exceptions.Forbidden: # Suspended, shadowbanned, or PRAW issue
+                raise AccessForbiddenError(f"Access forbidden to Reddit user u/{username} (possibly suspended, shadowbanned, or blocked).")
+            except (prawcore.exceptions.PrawcoreException, RuntimeError) as client_err: # Broader PRAW errors
+                logger.error(f"Reddit API/client error accessing user u/{username}: {client_err}")
+                raise RuntimeError(f"Reddit API error: {client_err}")
 
-            if self.args.offline: # Should have been caught by the initial offline check, but defensive
-                if cached_profile_info:
-                    redditor_info = cached_profile_info
-                    logger.info(f"Offline mode (redundant check): Using cached profile for Reddit u/{username}.")
-                    should_fetch_live_profile = False
-                else:
-                    logger.warning(f"Offline mode (redundant check): No cached profile found for Reddit u/{username}. Profile details will be unavailable.")
-                    should_fetch_live_profile = False 
-            elif not force_refresh and cached_profile_info: # Online, not forcing refresh, and have cached profile
-                redditor_info = cached_profile_info # Use cached profile
-                logger.info(f"Using cached profile for Reddit u/{username}.")
-                should_fetch_live_profile = False
-            
-            # If we still need to fetch live (online AND (force_refresh OR no cached_profile_info available))
-            if should_fetch_live_profile:
-                logger.info(f"Fetching live profile data for Reddit u/{username}.")
-                try:
-                    # These attributes will trigger API calls
-                    live_redditor_id = redditor_praw_obj.id 
-                    live_redditor_created_utc = redditor_praw_obj.created_utc
-                    
-                    # Populate redditor_info with live data
-                    redditor_info = {
-                        "id": live_redditor_id, 
-                        "name": redditor_praw_obj.name, # Should match input 'username'
-                        "created_utc": datetime.fromtimestamp(live_redditor_created_utc, tz=timezone.utc).isoformat(),
-                        "link_karma": getattr(redditor_praw_obj, "link_karma", 0),
-                        "comment_karma": getattr(redditor_praw_obj, "comment_karma", 0),
-                        "icon_img": getattr(redditor_praw_obj, "icon_img", None),
-                        "is_suspended": getattr(redditor_praw_obj, "is_suspended", False)
-                    }
-                    if redditor_info.get("is_suspended"):
-                        logger.warning(f"Reddit user u/{username} (live check) is suspended.")
-                    logger.debug(f"Successfully fetched live profile for Reddit u/{username}.")
-
-                except prawcore.exceptions.NotFound:
-                    raise UserNotFoundError(f"Reddit user u/{username} not found (live profile fetch).")
-                except prawcore.exceptions.Forbidden: 
-                    # This can happen if user is suspended/shadowbanned, or if our access is blocked
-                    # If suspended, is_suspended should ideally be True if PRAW can fetch it.
-                    # If it's a hard Forbidden (403 on profile access), we might not get is_suspended.
-                    # We'll log it as AccessForbiddenError.
-                    logger.warning(f"Access forbidden to Reddit user u/{username}'s profile (live fetch). User might be suspended, shadowbanned, or access blocked.")
-                    # Attempt to see if PRAW object still yields 'is_suspended' despite broader 403
-                    # It might be None or False if the initial profile load failed completely.
-                    is_suspended_attr = getattr(redditor_praw_obj, 'is_suspended', None)
-                    if is_suspended_attr is True: # If we know they are suspended
-                         redditor_info = {"name": username, "is_suspended": True, "id": None} # Minimal info
-                         logger.warning(f"Marking user u/{username} as suspended based on PRAW attribute after Forbidden error.")
-                    else: # Could not confirm suspension, just a general access issue
-                         raise AccessForbiddenError(f"Access forbidden to Reddit user u/{username}'s profile (live fetch).")
-
-                except (prawcore.exceptions.PrawcoreException, RuntimeError) as client_err: 
-                    logger.error(f"Reddit API/client error accessing user u/{username} (live profile fetch): {client_err}")
-                    raise RuntimeError(f"Reddit API error (live profile fetch): {client_err}")
-
-            # --- Fetch Submissions ---
             new_submissions_data = []
-            newly_added_media_analysis = [] # For this fetch run only
-            newly_added_media_paths = set()    # For this fetch run only
-            fetch_limit_val = INCREMENTAL_FETCH_LIMIT 
-            count_subs = 0 
-            processed_submission_ids = {s["id"] for s in existing_submissions} 
+            newly_added_media_analysis = []
+            newly_added_media_paths = set()
+            fetch_limit_val = INCREMENTAL_FETCH_LIMIT # PRAW handles pagination internally based on 'before' # Renamed fetch_limit
+            count = 0 # Count items processed from API, not just added
+            processed_ids = {s["id"] for s in existing_submissions} # Track by simple ID for submissions
 
             logger.debug("Fetching new submissions...")
             try:
-                params_subs: Dict[str, Union[int, str]] = {"limit": fetch_limit_val}
+                params: Dict[str, Union[int, str]] = {"limit": fetch_limit_val} # PRAW uses this for each page it fetches if 'before' is used.
                 if not force_refresh and latest_submission_fullname:
-                    params_subs["before"] = latest_submission_fullname 
+                    params["before"] = latest_submission_fullname # Fetch items *before* this one
                     logger.debug(f"Fetching submissions before {latest_submission_fullname}")
-                
-                for submission in redditor_praw_obj.submissions.new(limit=fetch_limit_val, params=params_subs):
-                    count_subs +=1
+                # Iterate through new submissions. PRAW's `new` generator handles pagination.
+                for submission in redditor.submissions.new(limit=fetch_limit_val, params=params):
+                    count +=1
+                    submission_fullname = submission.fullname # e.g. t3_xxxx
                     submission_id = submission.id
-                    if submission_id in processed_submission_ids: 
+                    if submission_id in processed_ids: # Should not happen if 'before' works correctly, but defensive
                         logger.debug(f"Skipping already processed submission ID: {submission_id}")
                         continue
 
                     media_items_for_submission = []
-                    # ... (rest of your media handling logic for submissions - unchanged)
+                    media_processed_inline = False # Flag to avoid double processing for gallery
+                    # Handle direct media links and Reddit-hosted media
                     submission_url = getattr(submission, "url", None)
                     if submission_url:
+                        # Check if URL itself points to a common image/video extension or Reddit media domains
                         is_direct_media_link = any(submission_url.lower().endswith(ext) for ext in SUPPORTED_IMAGE_EXTENSIONS + [".mp4", ".webm", ".mov"])
                         is_reddit_media = any(host in urlparse(submission_url).netloc for host in ["i.redd.it", "v.redd.it", "preview.redd.it"])
 
@@ -1376,19 +1347,22 @@ class SocialOSINTLM:
                                 media_items_for_submission.append({"type": "image" if media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS else "video", "analysis": analysis, "url": submission_url, "local_path": str(media_path)})
                                 if analysis: newly_added_media_analysis.append(analysis)
                                 newly_added_media_paths.add(str(media_path))
+                                media_processed_inline = True
 
+                    # Handle galleries (submission.is_gallery and submission.media_metadata)
                     is_gallery = getattr(submission, "is_gallery", False)
                     media_metadata = getattr(submission, "media_metadata", None)
-                    if not media_items_for_submission and is_gallery and media_metadata: # if not already processed as direct link
-                        for media_id_key, media_item_val in media_metadata.items(): 
+                    if not media_processed_inline and is_gallery and media_metadata:
+                        for media_id_key, media_item_val in media_metadata.items(): # renamed media_id, media_item
+                            # Try to get highest quality image URL ('s' for source, 'p' for previews)
                             source = media_item_val.get("s")
-                            preview_data = media_item_val.get("p", []) 
+                            preview_data = media_item_val.get("p", []) # Previews are typically ordered by size
                             image_url = None
-                            if source: image_url = source.get("u") or source.get("gif") 
-                            if not image_url and preview_data: image_url = preview_data[-1].get("u") 
+                            if source: image_url = source.get("u") or source.get("gif") # u for URL, gif for GIF
+                            if not image_url and preview_data: image_url = preview_data[-1].get("u") # Largest preview
 
                             if image_url:
-                                image_url_clean = image_url.replace("&amp;", "&") 
+                                image_url_clean = image_url.replace("&amp;", "&") # Fix HTML entities # Renamed image_url
                                 media_path = self._download_media(url=image_url_clean, platform="reddit", username=username)
                                 if media_path:
                                     analysis = None
@@ -1397,32 +1371,27 @@ class SocialOSINTLM:
                                     media_items_for_submission.append({"type": "gallery_image", "analysis": analysis, "url": image_url_clean, "alt_text": media_item_val.get("caption") or media_item_val.get("title"), "local_path": str(media_path)})
                                     if analysis: newly_added_media_analysis.append(analysis)
                                     newly_added_media_paths.add(str(media_path))
-                    
-                    submission_data = {"id": submission_id, "fullname": submission.fullname, "title": submission.title, 
-                                       "text": submission.selftext[:2000] if hasattr(submission, "selftext") else "",
-                                       "score": submission.score, "upvote_ratio": getattr(submission, "upvote_ratio", None), 
-                                       "subreddit": submission.subreddit.display_name, "permalink": f"https://www.reddit.com{submission.permalink}", 
-                                       "created_utc": datetime.fromtimestamp(submission.created_utc, tz=timezone.utc).isoformat(),
-                                       "url": submission.url if submission.is_self else None, 
-                                       "link_url": submission.url if not submission.is_self else None,
-                                       "is_self": submission.is_self, "is_gallery": is_gallery, 
-                                       "num_comments": submission.num_comments, "stickied": submission.stickied, 
-                                       "over_18": submission.over_18, "spoiler": submission.spoiler, "media": media_items_for_submission}
+
+                    submission_data = {"id": submission_id, "fullname": submission_fullname, "title": submission.title, "text": submission.selftext[:2000] if hasattr(submission, "selftext") else "", # Limit selftext length
+                                       "score": submission.score, "upvote_ratio": getattr(submission, "upvote_ratio", None), "subreddit": submission.subreddit.display_name, "permalink": f"https://www.reddit.com{submission.permalink}", "created_utc": datetime.fromtimestamp(submission.created_utc, tz=timezone.utc).isoformat(),
+                                       "url": submission.url if submission.is_self else None, # URL of the post itself if self-post
+                                       "link_url": submission.url if not submission.is_self else None, # External link URL if link-post
+                                       "is_self": submission.is_self, "is_gallery": is_gallery, "num_comments": submission.num_comments, "stickied": submission.stickied, "over_18": submission.over_18, "spoiler": submission.spoiler, "media": media_items_for_submission}
                     new_submissions_data.append(submission_data)
-                    processed_submission_ids.add(submission_id) 
-            except prawcore.exceptions.Forbidden: 
+                    processed_ids.add(submission_id) # Add to processed set
+            except prawcore.exceptions.Forbidden: # Subreddit might be private/quarantined
                 logger.warning(f"Access forbidden while fetching submissions for u/{username} (possibly subreddit restriction).")
             except prawcore.exceptions.RequestException as req_err:
-                if hasattr(req_err, "response") and req_err.response is not None and req_err.response.status_code == 429: 
+                if hasattr(req_err, "response") and req_err.response is not None and req_err.response.status_code == 429: # Rate limit
                     self._handle_rate_limit("Reddit", exception=req_err)
                     return None
-                else: 
+                else: # pragma: no cover
                     logger.error(f"Reddit request failed fetching submissions for u/{username}: {req_err}")
-            logger.info(f"Fetched {len(new_submissions_data)} new submissions for u/{username} (scanned approx {count_subs}).")
+            logger.info(f"Fetched {len(new_submissions_data)} new submissions for u/{username} (scanned approx {count}).")
 
-            # --- Fetch Comments ---
+
             new_comments_data = []
-            count_comments = 0
+            count = 0
             processed_comment_ids = {c["id"] for c in existing_comments}
             logger.debug("Fetching new comments...")
             try:
@@ -1430,29 +1399,26 @@ class SocialOSINTLM:
                 if not force_refresh and latest_comment_fullname:
                     params_comments["before"] = latest_comment_fullname
                     logger.debug(f"Fetching comments before {latest_comment_fullname}")
-                for comment in redditor_praw_obj.comments.new(limit=fetch_limit_val, params=params_comments):
-                    count_comments += 1
+                for comment in redditor.comments.new(limit=fetch_limit_val, params=params_comments):
+                    count += 1
+                    comment_fullname = comment.fullname
                     comment_id = comment.id
                     if comment_id in processed_comment_ids:
                         logger.debug(f"Skipping already processed comment ID: {comment_id}")
                         continue
-                    new_comments_data.append({"id": comment_id, "fullname": comment.fullname, 
-                                              "text": comment.body[:2000], 
-                                              "score": comment.score, "subreddit": comment.subreddit.display_name, 
-                                              "permalink": f"https://www.reddit.com{comment.permalink}", 
-                                              "created_utc": datetime.fromtimestamp(comment.created_utc, tz=timezone.utc).isoformat(),
-                                              "is_submitter": comment.is_submitter, "stickied": comment.stickied, 
-                                              "parent_id": comment.parent_id, "submission_id": comment.submission.id})
+                    new_comments_data.append({"id": comment_id, "fullname": comment_fullname, "text": comment.body[:2000], # Limit comment length
+                                              "score": comment.score, "subreddit": comment.subreddit.display_name, "permalink": f"https://www.reddit.com{comment.permalink}", "created_utc": datetime.fromtimestamp(comment.created_utc, tz=timezone.utc).isoformat(),
+                                              "is_submitter": comment.is_submitter, "stickied": comment.stickied, "parent_id": comment.parent_id, "submission_id": comment.submission.id})
                     processed_comment_ids.add(comment_id)
-            except prawcore.exceptions.Forbidden: 
+            except prawcore.exceptions.Forbidden: # pragma: no cover (harder to trigger for comments specifically)
                  logger.warning(f"Access forbidden while fetching comments for u/{username}.")
-            except prawcore.exceptions.RequestException as req_err: 
+            except prawcore.exceptions.RequestException as req_err: # Rate limit or other
                 if hasattr(req_err, "response") and req_err.response is not None and req_err.response.status_code == 429:
                     self._handle_rate_limit("Reddit", exception=req_err)
                     return None
-                else: 
+                else: # pragma: no cover
                     logger.error(f"Reddit request failed fetching comments for u/{username}: {req_err}")
-            logger.info(f"Fetched {len(new_comments_data)} new comments for u/{username} (scanned approx {count_comments}).")
+            logger.info(f"Fetched {len(new_comments_data)} new comments for u/{username} (scanned approx {count}).")
 
 
             # Combine, sort, limit
@@ -1473,33 +1439,28 @@ class SocialOSINTLM:
             submissions_with_media = len([s for s in final_submissions if s.get("media")])
             avg_sub_score = sum(s.get("score",0) for s in final_submissions) / max(total_submissions, 1)
             avg_comment_score = sum(c.get("score",0) for c in final_comments) / max(total_comments, 1)
-            avg_sub_upvote_ratio = sum(s.get("upvote_ratio", 0.0) or 0.0 for s in final_submissions if s.get("upvote_ratio") is not None) / max(len([s for s in final_submissions if s.get("upvote_ratio") is not None]), 1)
+            # upvote_ratio can be None, so filter and provide default
+            avg_sub_upvote_ratio = sum(s.get("upvote_ratio", 0.0) or 0.0 for s in final_submissions if s.get("upvote_ratio") is not None) / max(len([s for s in final_submissions if s.get("upvote_ratio") is not None]), 1) # Calculate average only for submissions with a ratio
 
-            stats = {"total_submissions_cached": total_submissions, "total_comments_cached": total_comments, 
-                     "submissions_with_media": submissions_with_media, "total_media_items_processed": len(final_media_paths), 
-                     "avg_submission_score": round(avg_sub_score,2), "avg_comment_score": round(avg_comment_score,2), 
-                     "avg_submission_upvote_ratio": round(avg_sub_upvote_ratio,3)}
 
-            final_data = {"timestamp": datetime.now(timezone.utc).isoformat(), 
-                          "user_profile": redditor_info, # Use the correctly populated redditor_info
-                          "submissions": final_submissions, "comments": final_comments, 
-                          "media_analysis": final_media_analysis, "media_paths": final_media_paths, "stats": stats}
+            stats = {"total_submissions_cached": total_submissions, "total_comments_cached": total_comments, "submissions_with_media": submissions_with_media, "total_media_items_processed": len(final_media_paths), "avg_submission_score": round(avg_sub_score,2), "avg_comment_score": round(avg_comment_score,2), "avg_submission_upvote_ratio": round(avg_sub_upvote_ratio,3)}
+
+            final_data = {"timestamp": datetime.now(timezone.utc).isoformat(), # Handled by _save_cache
+                          "user_profile": redditor_info, "submissions": final_submissions, "comments": final_comments, "media_analysis": final_media_analysis, "media_paths": final_media_paths, "stats": stats}
             self._save_cache("reddit", username, final_data)
             logger.info(f"Successfully updated Reddit cache for u/{username}. Cached submissions: {total_submissions}, comments: {total_comments}")
             return final_data
 
-        except RateLimitExceededError: 
+        except RateLimitExceededError: # pragma: no cover
             logger.warning(f"Reddit fetch for u/{username} aborted due to rate limit.")
             return None
         except (UserNotFoundError, AccessForbiddenError) as user_err:
             logger.error(f"Reddit fetch failed for u/{username}: {user_err}")
-             # If user_profile could not be fetched and we have no cached profile, we might still have submissions/comments.
-             # Decide if we want to save partial data or not. Currently, it returns None, so no save.
             return None
-        except RuntimeError as e: 
+        except RuntimeError as e: # From self.reddit setup
             logger.error(f"Runtime error during Reddit fetch for u/{username}: {e}")
             return None
-        except Exception as e: 
+        except Exception as e: # pragma: no cover
             logger.error(f"Unexpected error fetching Reddit data for u/{username}: {str(e)}", exc_info=True)
             return None
 
@@ -2772,8 +2733,8 @@ class SocialOSINTLM:
             "query": query,
             "platforms_analyzed": sorted(platforms_analyzed),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "text_model": os.getenv("ANALYSIS_MODEL"),
-            "image_model": os.getenv("IMAGE_ANALYSIS_MODEL"),
+            "text_model": os.getenv("ANALYSIS_MODEL", "unknown"),
+            "image_model": os.getenv("IMAGE_ANALYSIS_MODEL", "unknown"),
             "output_format": format_type,
             "mode": "Offline (Cached Data Only)" if self.args.offline else "Online", # Add mode to metadata
         }
