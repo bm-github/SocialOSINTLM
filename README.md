@@ -1,36 +1,36 @@
 # 🚀 SocialOSINTLM
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon and Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Mastodon (multi-instance),  Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 ## 🌟 Key Features
 
-✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Hacker News (via Algolia API), Mastodon and Bluesky
+✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Bluesky, Hacker News (via Algolia API), and Mastodon.  .
 
-✅ **AI-Powered Analysis:** Utilises configurable models via the OpenRouter API for sophisticated text and image analysis
+✅ **AI-Powered Analysis:** Utilises configurable models via OpenAI-compatible APIs for sophisticated text and image analysis.
 
-✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style
+✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style.
 
-✅ **Vision-Capable Image Analysis:** analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity)
+✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity).
 
-✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1536x1536 recommended for many models) for analysis before analysis
+✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (e.g., Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1536x1536 recommended for many models) for analysis.
 
-✅ **Cross-Account Comparison:** analyze profiles across multiple selected platforms simultaneously
+✅ **Cross-Account Comparison:** Analyze profiles across multiple selected platforms simultaneously.
 
-✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`
+✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter & LLM APIs, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`.
 
-✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyzes. Media files are cached in `data/media/`
+✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`.
 
-✅ **Offline Mode (`--offline`):** Run analysis using only locally cached data, ignores cache limit, skipping all external network requests (social platforms, media downloads, *new* vision analysis).
+✅ **Offline Mode (`--offline`):** Run analysis using only locally cached data, ignores cache expiry, skipping all external network requests (social platforms, media downloads, *new* vision analysis).
 
-✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results
+✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results.
 
-✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`)
+✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`).
 
-✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 50 tweets, 50 Reddit submissions, 50 Reddit comments, 50 HN items, ~40 Mastodon/Bluesky posts per API call) to balance depth and API usage. Note: Incremental fetches are typically 50, initial fetches can be more.
+✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 50 tweets, 50 Reddit submissions/comments, 50 HN items, ~40 Mastodon/Bluesky posts per API call) to balance depth and API usage.
 
-✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`
+✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`.
 
-✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file
+✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file, and a JSON file for Mastodon instances.
 
 ```mermaid
 flowchart TD
@@ -129,7 +129,6 @@ flowchart TD
     WB --> |No| H
 
     %% Result display for each save option
-    %% Result display for each save option
     GA --> V1
     %% Custom Styling
     classDef defaultClass fill:#FFFFFF,stroke:#333,stroke-width:1px,color:#000
@@ -139,7 +138,7 @@ flowchart TD
     classDef redditClass fill:#FF5700,stroke:#8D2202,stroke-width:2px,color:#FFF
     classDef hnClass fill:#FF6600,stroke:#7F3300,stroke-width:2px,color:#FFF
     classDef bskyClass fill:#66BB6A,stroke:#1B5E20,stroke-width:2px,color:#FFF
-    classDef MastodonClass fill:#66BB6A,stroke:#1B5E20,stroke-width:2px,color:#FFF
+    classDef MastodonClass fill:#9575CD,stroke:#4527A0,stroke-width:2px,color:#FFF %% Changed color for Mastodon
     classDef multiClass fill:#4DB6AC,stroke:#004D40,stroke-width:2px,color:#FFF
     classDef inputClass fill:#E3F2FD,stroke:#1976D2,stroke-width:2px,color:#000
     classDef loopClass fill:#CE93D8,stroke:#6A1B9A,stroke-width:2px,color:#000
@@ -178,47 +177,73 @@ flowchart TD
     ```bash
     pip install -r requirements.txt
     ```
-3.  **Set up Environment Variables:**
+    *(Ensure `requirements.txt` includes: `httpx`, `tweepy`, `praw`, `Mastodon.py`, `beautifulsoup4`, `rich`, `Pillow`, `atproto`, `python-dotenv`, `openai`)*
+
+3.  **Set up Configuration:**
+
+    **a. Environment Variables (`.env` file):**
     Create a `.env` file in the project root or export the following environment variables:
 
-    ```sh
-    # --- Platform API Keys ---
-    # Twitter/X (Requires Elevated/Academic access for user tweet lookups)
-    export TWITTER_BEARER_TOKEN='your_twitter_v2_bearer_token'
+    ```dotenv
+    # .env
 
-    # Reddit (Create an app at https://www.reddit.com/prefs/apps)
-    export REDDIT_CLIENT_ID='your_reddit_client_id'
-    export REDDIT_CLIENT_SECRET='your_reddit_client_secret'
-    export REDDIT_USER_AGENT='YourAppName/1.0 by YourUsername' # Customise this
+    # --- LLM Configuration (Required) ---
+    LLM_API_KEY="your_llm_api_key"
+    LLM_API_BASE_URL="https://api.example.com/v1" # e.g., https://openrouter.ai/api/v1
+    ANALYSIS_MODEL="your_text_analysis_model_name"
+    IMAGE_ANALYSIS_MODEL="your_vision_model_name"
 
-    # Bluesky (Generate an App Password in Bluesky settings)
-    export BLUESKY_IDENTIFIER='your-handle.bsky.social' # Your full Bluesky handle
-    export BLUESKY_APP_SECRET='xxxx-xxxx-xxxx-xxxx' # Your generated App Password
+    # --- Optional: OpenRouter Specific Headers (if LLM_API_BASE_URL is OpenRouter) ---
+    # OPENROUTER_REFERER="http://localhost:3000"
+    # OPENROUTER_X_TITLE="SocialOSINTLM"
 
-    # Mastodon (Get from your Mastodon app settings)
-    export MASTODON_API_BASE_URL='https://mastodon.example' # Your Mastodon server (e.g., https://mastodon.social)
-    export MASTODON_ACCESS_TOKEN='your_access_token'
+    # --- Platform API Keys (as needed) ---
+    # Twitter/X
+    TWITTER_BEARER_TOKEN="your_twitter_v2_bearer_token"
 
+    # Reddit
+    REDDIT_CLIENT_ID="your_reddit_client_id"
+    REDDIT_CLIENT_SECRET="your_reddit_client_secret"
+    REDDIT_USER_AGENT="YourAppName/1.0 by YourUsername"
 
-    # --- AI Analysis API (OpenAI-Compatible) ---
-    # Generic LLM API Key (e.g., OpenRouter, OpenAI, or placeholder for self-hosted)
-    export LLM_API_KEY='your_llm_api_key'
-    # Base URL for the LLM API (e.g., https://openrouter.ai/api/v1, https://api.openai.com/v1, or http://localhost:8000/v1)
-    export LLM_API_BASE_URL='your_llm_api_base_url'
+    # Bluesky
+    BLUESKY_IDENTIFIER="your-handle.bsky.social"
+    BLUESKY_APP_SECRET="xxxx-xxxx-xxxx-xxxx" # App Password
 
-    # --- AI Model Selection (Provider-Specific Model Names) ---
-    # Model for text analysis (must be compatible with LLM_API_BASE_URL provider)
-    export ANALYSIS_MODEL='google/gemini-2.0-flash-001' # Example for OpenRouter
-    # Vision-capable model for image analysis (must be compatible and support vision)
-    export IMAGE_ANALYSIS_MODEL='openai/gpt-4o-mini' # Example for OpenRouter, must support vision
-
-    # --- Optional: OpenRouter Specific Headers (if using OpenRouter as LLM_API_BASE_URL) ---
-    # Your site URL or app name (recommended by OpenRouter)
-    # export OPENROUTER_REFERER='http://localhost:3000' # Default if not set and using OpenRouter
-    # Your project name (recommended by OpenRouter)
-    # export OPENROUTER_X_TITLE='SocialOSINTLM' # Default if not set and using OpenRouter
+    # --- Mastodon Configuration File Path ---
+    # Path to your Mastodon JSON config. Defaults to "mastodon_instances.json" if not set.
+    # MASTODON_CONFIG_FILE="config/my_mastodon_servers.json"
     ```
-    *Note: The script automatically loads variables from a `.env` file if present.*
+    *Note: HackerNews does not require API keys.*
+
+    **b. Mastodon Instance Configuration (JSON file):**
+    If using Mastodon, create a JSON file (e.g., `mastodon_instances.json` in the root directory, or specify path in `.env` via `MASTODON_CONFIG_FILE`).
+
+    **Example `mastodon_instances.json`:**
+    ```json
+    [
+      {
+        "name": "Mastodon.Social (Default for Lookups)",
+        "api_base_url": "https://mastodon.social",
+        "access_token": "YOUR_ACCESS_TOKEN_FOR_MASTODON_SOCIAL",
+        "is_default_lookup_instance": true
+      },
+      {
+        "name": "Tech Instance",
+        "api_base_url": "https://example2.org",
+        "access_token": "YOUR_ACCESS_TOKEN_FOR_OTHER_ORG"
+      },
+      {
+        "name": "Another Server",
+        "api_base_url": "https://mastodon.example.net",
+        "access_token": "YOUR_ACCESS_TOKEN_FOR_EXAMPLE_NET"
+      }
+    ]
+    ```
+    *   **`name`**: A user-friendly name for the instance (optional).
+    *   **`api_base_url`**: **Required.** The full base URL of the Mastodon instance (e.g., `https://mastodon.social`).
+    *   **`access_token`**: **Required.** Your application's access token for this specific instance.
+    *   **`is_default_lookup_instance`**: (Optional, boolean) If `true`, this instance's client will be used for looking up users on Mastodon instances not explicitly listed in this config (federated lookup). **Only one instance should be marked as `true`.** If none are marked, the first successfully initialized client may be used as a fallback.
 
 ## 🚀 Usage
 
@@ -237,7 +262,7 @@ python socialosintlm.py --offline
     *   **Reddit:** Usernames *without* the leading `u/`.
     *   **Hacker News:** Usernames as they appear.
     *   **Bluesky:** Full handles including `.bsky.social` (or custom domain).
-    *   **Mastodon:** Full handles in `user@instance.domain` format. If instance is missing, it may prompt to use the instance from `MASTODON_API_BASE_URL`.
+    *   **Mastodon:** Full handles in `user@instance.domain` format. If an instance is missing for a username and a default Mastodon lookup instance is configured (via `is_default_lookup_instance: true` in your JSON), the tool will prompt to assume the user is on that default instance.
 3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "analyze recent activity patterns", "Identify key interests", "Assess communication style").
 4.  **Commands within the analysis loop:**
     *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data. **Note: This command is disabled in offline mode (`--offline`).**
@@ -250,26 +275,30 @@ python socialosintlm.py --offline
 Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing.
 
 ```bash
-        echo '{
-        "platforms": {
-        "twitter": ["user1", "user2"],
-        "reddit": ["user3"],
-        "hackernews": ["user4"],
-        "bluesky": ["handle1.bsky.social"],
-        "mastodon": ["user@instance.social", "another@other.server"]
-        },
-        "query": "Analyze communication style and main topics."
-        }' | python socialosintlm.py --stdin
+echo '{
+  "platforms": {
+    "twitter": ["someTwitterUser", "anotherXAccount"],
+    "reddit": "aRedditUsername",
+    "mastodon": [
+      "user1@mastodon.social",
+      "researcher@example2.org",
+      "curious@some.other.instance"
+    ],
+    "bluesky": "handle.bsky.social",
+    "hackernews": "pg"
+  },
+  "query": "Analyze the primary topics of discussion and any indications of technical expertise across these accounts. Are there notable differences in communication style between platforms for the same individual, if applicable?"
+}' | python socialosintlm.py --stdin
 ```
 Combine with `--offline` to use only cached data:
 ```bash
-        echo '{
-        "platforms": {
-        "twitter": ["user1", "user2"],
-        "reddit": ["user3"]
-        },
-        "query": "Summarize cached activity."
-        }' | python socialosintlm.py --stdin --offline
+echo '{
+  "platforms": {
+    "twitter": ["user1", "user2"],
+    "reddit": ["user3"]
+  },
+  "query": "Summarize cached activity."
+}' | python socialosintlm.py --stdin --offline
 ```
 When using `--stdin --offline`, only cached data will be used. If a platform/user has no cache entry, it will be skipped. The tool will exit with a non-zero status code if *no* data could be loaded for *any* requested target due to missing cache entries.
 
@@ -290,7 +319,7 @@ When using `--stdin --offline`, only cached data will be used. If a platform/use
 *   Use the "Purge Data" option in the main menu to clear cache, media, or output reports.
 
 ## 🔍 Error Handling & Logging
-*   **Rate Limits:** Detects API rate limits. For Twitter and some LLM providers, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally. **Note:** Rate limit handling is bypassed in offline mode as no API calls are made.
+*   **Rate Limits:** Detects API rate limits. For Twitter, Mastodon, and some LLM providers, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally. **Note:** Rate limit handling is bypassed in offline mode as no API calls are made.
 *   **API Errors:** Handles common platform-specific errors (e.g., user not found, forbidden access, general request issues) during online fetching. **Note:** These errors are avoided in offline mode as fetching is skipped.
 *   **LLM API Errors:** Handles errors from the LLM API (e.g., authentication, rate limits, bad requests), providing informative messages.
 *   **Media Download Errors:** Logs issues during media download or processing (online mode only).
@@ -317,7 +346,7 @@ When using `--stdin --offline`, only cached data will be used. If a platform/use
 *   Analyzes valid downloaded images using the vision LLM. **Note:** This step is skipped in Offline Mode if the image file is not in the local cache.
 
 ## 🔒 Security Considerations
-*   **API Keys:** Requires potentially sensitive API keys and secrets (e.g., `LLM_API_KEY`, platform tokens) stored as environment variables or in a `.env` file. Ensure this file is secured and added to `.gitignore`. LLM keys/URLs are still needed even in offline mode as the analysis itself is performed by the LLM (unless you hypothetically ran the LLM elsewhere and only used the tool for data collection).
+*   **API Keys:** Requires potentially sensitive API keys and secrets (e.g., `LLM_API_KEY`, platform tokens, Mastodon instance tokens in the JSON config) stored in environment variables or in a `.env` file and `mastodon_instances.json`. Ensure these files are secured and added to `.gitignore`. LLM keys/URLs are still needed even in offline mode as the analysis itself is performed by the LLM.
 *   **Data Caching:** Fetched data and downloaded media are stored locally in the `data/` directory. Be mindful of the sensitivity of the data being analyzed and secure the directory appropriately. **In offline mode, this cache is the *only* data source.**
 *   **Terms of Service:** Ensure your use of the tool complies with the Terms of Service of each social media platform and your chosen LLM API provider. Automated querying can be subject to restrictions. Using offline mode may mitigate some ToS concerns related to excessive querying, but does not negate ToS related to data storage or analysis.
 

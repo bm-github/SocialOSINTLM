@@ -139,6 +139,14 @@ class SocialOSINTLM:
         # Ensure 'offline' attribute exists, defaulting to False if not in args (e.g. direct instantiation)
         if not hasattr(self.args, 'offline'):
             self.args.offline = False # Default to online if 'offline' arg not present
+
+        # Mastodon multi-instance attributes
+        self.mastodon_config_file_path_str = os.getenv("MASTODON_CONFIG_FILE", "mastodon_instances.json")
+        # self.mastodon_config_file_path will be resolved in _initialize_mastodon_clients
+        # to check relative to base_dir and then as provided.
+        self._mastodon_clients: Dict[str, Mastodon] = {} # Key: api_base_url, Value: Mastodon client
+        self._default_mastodon_lookup_client: Optional[Mastodon] = None
+        self._mastodon_clients_initialized: bool = False
             
         self._verify_env_vars() # This will now check LLM vars too
 
@@ -152,8 +160,23 @@ class SocialOSINTLM:
                 "Please set LLM_API_KEY, LLM_API_BASE_URL, IMAGE_ANALYSIS_MODEL, and ANALYSIS_MODEL."
             )
 
-        # Check for at least one platform credential set
-        # This check is still relevant as offline mode relies on previously fetched (and thus configured) data.
+        # Check for Mastodon configuration file existence first
+        # self.mastodon_config_file_path_str is set in __init__
+        path_relative_to_base_dir = self.base_dir / self.mastodon_config_file_path_str
+        path_as_provided = Path(self.mastodon_config_file_path_str)
+        
+        mastodon_config_found = False
+        if path_relative_to_base_dir.is_file():
+            mastodon_config_found = True
+            logger.info(f"Mastodon configuration file found at: {path_relative_to_base_dir}")
+        elif path_as_provided.is_file():
+            mastodon_config_found = True
+            logger.info(f"Mastodon configuration file found at: {path_as_provided}")
+        else:
+            logger.debug(f"Mastodon configuration file '{self.mastodon_config_file_path_str}' not found. Mastodon availability depends on other platforms.")
+
+
+        # Check for at least one platform credential set OR Mastodon config file
         platforms_configured = any(
             [
                 all(os.getenv(k) for k in ["TWITTER_BEARER_TOKEN"]),
@@ -166,20 +189,23 @@ class SocialOSINTLM:
                     ]
                 ),
                 all(os.getenv(k) for k in ["BLUESKY_IDENTIFIER", "BLUESKY_APP_SECRET"]),
-                all(
-                    os.getenv(k)
-                    for k in ["MASTODON_ACCESS_TOKEN", "MASTODON_API_BASE_URL"]
-                ),
+                mastodon_config_found, # Mastodon is considered "configured" if its JSON file exists
             ]
         )
+        
         # HN needs no keys, considered configured if no other platform is.
-        available_no_creds = self.get_available_platforms(check_creds=False)
-        if not platforms_configured and "hackernews" not in available_no_creds:
+        available_no_creds = self.get_available_platforms(check_creds=False) # Get all conceptually known platforms
+        
+        is_only_hackernews_conceptually = "hackernews" in available_no_creds and len(available_no_creds) == 1
+
+        if not platforms_configured and not is_only_hackernews_conceptually:
             logger.warning(
-                "No platform API credentials found in environment variables. Only HackerNews might work."
-                " Please set credentials for at least one platform or note that only HackerNews will function."
+                "No platform API credentials (Twitter, Reddit, Bluesky) found AND Mastodon configuration file is missing or not found."
+                " Only HackerNews might work if it's the sole available platform concept. "
+                "Please set credentials for at least one platform or provide a 'MASTODON_CONFIG_FILE' via environment variable (default: mastodon_instances.json)."
             )
-        elif not platforms_configured and "hackernews" in available_no_creds:
+        elif not platforms_configured and is_only_hackernews_conceptually:
+            # This case means only HackerNews is conceptually available and nothing else is configured.
             pass # HackerNews alone is okay if no other platforms are configured
 
     def _setup_directories(self):
@@ -365,69 +391,193 @@ class SocialOSINTLM:
                 ) # Re-raise as RuntimeError for caller to handle
         return self._bluesky_client
 
-    @property
-    def mastodon(self) -> Mastodon:
-        """Initializes and returns the Mastodon client."""
-        if not hasattr(self, "_mastodon_client"):
+    # Method to extract instance domain (NEW)
+    def _get_instance_domain_from_acct(self, acct: str) -> Optional[str]:
+        """Extracts the instance domain from a 'user@instance.domain' string."""
+        if "@" in acct:
+            parts = acct.split("@", 1)
+            if len(parts) == 2 and "." in parts[1] and parts[1].strip():
+                # Further check to ensure the domain part is not just "." or empty
+                domain_part = parts[1].strip()
+                if domain_part and domain_part != ".":
+                    return domain_part
+        logger.debug(f"Could not extract valid instance domain from account string: '{acct}'")
+        return None
+
+    # Method to initialize Mastodon clients from config (NEW)
+    def _initialize_mastodon_clients(self):
+        """
+        Initializes Mastodon clients from the JSON configuration file.
+        Populates self._mastodon_clients and self._default_mastodon_lookup_client.
+        """
+        if self._mastodon_clients_initialized:
+            logger.debug("Mastodon clients already attempted initialization.")
+            return
+
+        # Determine the correct path for the Mastodon config file
+        # Option 1: Path relative to self.base_dir
+        path_relative_to_base_dir = self.base_dir / self.mastodon_config_file_path_str
+        # Option 2: Path as directly provided (could be absolute or relative to CWD)
+        path_as_provided = Path(self.mastodon_config_file_path_str)
+
+        actual_config_path: Optional[Path] = None
+
+        if path_relative_to_base_dir.is_file():
+            actual_config_path = path_relative_to_base_dir
+            logger.debug(f"Found Mastodon config file at: {actual_config_path} (relative to base_dir)")
+        elif path_as_provided.is_file():
+            actual_config_path = path_as_provided
+            logger.debug(f"Found Mastodon config file at: {actual_config_path} (as provided)")
+        else:
+            logger.warning(
+                f"Mastodon config file '{self.mastodon_config_file_path_str}' not found at "
+                f"'{path_relative_to_base_dir}' (relative to data dir) or "
+                f"'{path_as_provided}' (as direct path). Mastodon functionality will be unavailable."
+            )
+            self._mastodon_clients_initialized = True # Mark as "initialized" (i.e., attempt made)
+            return
+
+        try:
+            with open(actual_config_path, "r", encoding="utf-8") as f:
+                instances_config = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding Mastodon config file '{actual_config_path}': {e}. Mastodon functionality impaired.")
+            self._mastodon_clients_initialized = True
+            return
+        except OSError as e:
+            logger.error(f"Error reading Mastodon config file '{actual_config_path}': {e}. Mastodon functionality impaired.")
+            self._mastodon_clients_initialized = True
+            return
+
+        if not isinstance(instances_config, list):
+            logger.error(f"Mastodon config file '{actual_config_path}' must contain a JSON list of instance objects. Mastodon functionality impaired.")
+            self._mastodon_clients_initialized = True
+            return
+
+        default_candidates = []
+        successful_clients_count = 0
+
+        for instance_conf in instances_config:
+            if not isinstance(instance_conf, dict):
+                logger.warning(f"Skipping invalid entry in Mastodon config (not a dictionary): {str(instance_conf)[:100]}")
+                continue
+
+            api_base_url = instance_conf.get("api_base_url")
+            access_token = instance_conf.get("access_token")
+            instance_name = instance_conf.get("name", api_base_url) # Default name to URL if not provided
+
+            if not api_base_url or not access_token:
+                logger.warning(f"Skipping incomplete Mastodon instance config for '{instance_name}': missing api_base_url or access_token.")
+                continue
+
+            parsed_url = urlparse(api_base_url)
+            if not parsed_url.scheme or not parsed_url.netloc:
+                logger.warning(f"Skipping Mastodon instance '{instance_name}' due to invalid api_base_url format: {api_base_url}. Should be like 'https://mastodon.social'.")
+                continue
+            
+            normalized_api_base_url = api_base_url.rstrip('/')
+
+
             try:
-                token = os.getenv("MASTODON_ACCESS_TOKEN")
-                base_url = os.getenv("MASTODON_API_BASE_URL")
-                if not token or not base_url:
-                    raise RuntimeError(
-                        "Mastodon credentials (MASTODON_ACCESS_TOKEN, MASTODON_API_BASE_URL) not set."
-                    )
-
-                parsed_url = urlparse(base_url)
-                if not parsed_url.scheme or not parsed_url.netloc:
-                    raise RuntimeError(
-                        f"Invalid MASTODON_API_BASE_URL format: {base_url}. Should be like 'https://mastodon.social'."
-                    )
-
                 client = Mastodon(
-                    access_token=token,
-                    api_base_url=base_url,
+                    access_token=access_token,
+                    api_base_url=normalized_api_base_url,
                     request_timeout=REQUEST_TIMEOUT,
                 )
-                # Skip instance check in offline mode to avoid network call
+
                 if not self.args.offline:
                     try:
-                        # Test connection and token validity
                         instance_info = client.instance()
-                        instance_title = instance_info.get("title", "N/A")
-                        instance_uri = instance_info.get("uri", "URI Missing")
-                        logger.debug(
-                            f"Connected to Mastodon instance: {instance_title} ({instance_uri})"
-                        )
+                        fetched_instance_title = instance_info.get("title", "N/A")
+                        logger.debug(f"Successfully connected to Mastodon instance: {fetched_instance_title} ({client.api_base_url}) for config entry '{instance_name}'")
                     except MastodonError as instance_err:
-                        logger.error(
-                            f"Failed to connect to Mastodon instance {base_url}: {instance_err}"
-                        )
-                        if "unauthorized" in str(instance_err).lower() or "401" in str(
-                            instance_err
-                        ):
-                            raise RuntimeError(
-                                f"Mastodon connection failed: Invalid Access Token for {base_url}."
-                            )
-                        elif "not found" in str(instance_err).lower() or "404" in str(
-                            instance_err
-                        ):
-                            raise RuntimeError(
-                                f"Mastodon connection failed: API base URL {base_url} seems incorrect (Not Found)."
-                            )
-                        else:
-                            raise RuntimeError(
-                                f"Mastodon connection failed for {base_url}: {instance_err}"
-                            )
+                        logger.error(f"Failed to connect/verify Mastodon instance {client.api_base_url} for '{instance_name}': {instance_err}")
+                        if "unauthorized" in str(instance_err).lower() or "401" in str(instance_err):
+                            logger.error(f" -> Suggestion: Check Access Token for {client.api_base_url}.")
+                        elif "not found" in str(instance_err).lower() or "404" in str(instance_err):
+                             logger.error(f" -> Suggestion: API base URL {client.api_base_url} seems incorrect.")
+                        # Do not add this client if connectivity check fails in online mode
+                        continue 
                 else:
-                    logger.info("Offline mode: Mastodon client initialized without instance connectivity check.")
+                    logger.info(f"Offline mode: Mastodon client for '{instance_name}' ({client.api_base_url}) initialized without connectivity check.")
+
+                self._mastodon_clients[normalized_api_base_url] = client
+                successful_clients_count += 1
+                if instance_conf.get("is_default_lookup_instance", False) is True:
+                    default_candidates.append(client)
+
+            except Exception as e: # Catch any error during Mastodon() instantiation
+                logger.error(f"Error initializing Mastodon client object for '{instance_name}' ({api_base_url}): {e}")
+
+        if default_candidates:
+            if len(default_candidates) > 1:
+                logger.warning(f"Multiple Mastodon instances marked as 'is_default_lookup_instance' in '{actual_config_path}'. Using the first one found: {default_candidates[0].api_base_url}")
+            self._default_mastodon_lookup_client = default_candidates[0]
+            logger.info(f"Default Mastodon lookup client set to: {self._default_mastodon_lookup_client.api_base_url}")
+        elif self._mastodon_clients: # No explicit default, pick first one available from successfully initialized clients
+            self._default_mastodon_lookup_client = next(iter(self._mastodon_clients.values()))
+            logger.info(f"No explicit default Mastodon lookup instance found. Using first successfully initialized client as default: {self._default_mastodon_lookup_client.api_base_url}")
 
 
-                self._mastodon_client = client
-                logger.debug(f"Mastodon client initialized for {base_url}.")
-            except (KeyError, RuntimeError) as e:
-                logger.error(f"Mastodon setup failed: {e}")
-                raise RuntimeError(f"Mastodon setup failed: {e}") # Re-raise as RuntimeError
-        return self._mastodon_client
+        if not self._mastodon_clients:
+            logger.warning(f"No Mastodon clients were successfully initialized from the configuration file: {actual_config_path}")
+        else:
+            logger.info(f"Successfully initialized {successful_clients_count} Mastodon client(s) from {actual_config_path}.")
+
+        self._mastodon_clients_initialized = True
+
+    # Method to get a specific or default Mastodon client (NEW)
+    def _get_mastodon_client(self, target_user_acct: Optional[str] = None) -> Optional[Mastodon]:
+        """
+        Gets an appropriate Mastodon client.
+        If target_user_acct (user@instance.domain) is provided, tries to find a specific client.
+        Otherwise, returns the default lookup client.
+        Initializes clients from config if not already done.
+        """
+        if not self._mastodon_clients_initialized:
+            self._initialize_mastodon_clients() # Ensure clients are loaded
+
+        # If clients still not initialized after attempt (e.g. config file error), bail.
+        if not self._mastodon_clients_initialized: # Should not be strictly necessary due to above call, but defensive
+            logger.error("Mastodon client initialization was not completed. Cannot get client.")
+            return None
+
+
+        if target_user_acct:
+            instance_domain = self._get_instance_domain_from_acct(target_user_acct)
+            if instance_domain:
+                # Try to find a client matching this instance_domain
+                # Common schemes are https and http. Check both for api_base_url matching.
+                # The keys in self._mastodon_clients are already normalized (e.g. https://domain.tld)
+                potential_urls_to_check = [
+                    f"https://{instance_domain}",
+                    f"http://{instance_domain}" # Less common for API but possible
+                ]
+                for p_url in potential_urls_to_check:
+                    normalized_p_url = p_url.rstrip('/')
+                    if normalized_p_url in self._mastodon_clients:
+                        logger.debug(f"Using specific Mastodon client for instance '{normalized_p_url}' to handle '{target_user_acct}'.")
+                        return self._mastodon_clients[normalized_p_url]
+                logger.debug(f"No specifically configured client for instance '{instance_domain}' of user '{target_user_acct}'. Will use default lookup client if available.")
+
+        if self._default_mastodon_lookup_client:
+            logger.debug(f"Using default Mastodon lookup client: {self._default_mastodon_lookup_client.api_base_url}")
+            return self._default_mastodon_lookup_client
+        
+        # Fallback: if no specific client for target_user_acct AND no default_lookup_client was set,
+        # but there ARE some clients initialized, use the first one available.
+        # This situation implies a config where no instance was marked as default,
+        # and the target user's instance wasn't directly configured.
+        if self._mastodon_clients: # pragma: no cover (should ideally be handled by default logic in _initialize_mastodon_clients)
+            first_available_client = next(iter(self._mastodon_clients.values()))
+            logger.warning(
+                f"No specific client for '{target_user_acct}' and no default lookup client was designated. "
+                f"Falling back to the first available Mastodon client: {first_available_client.api_base_url}"
+            )
+            return first_available_client
+
+        logger.warning(f"No Mastodon clients are available (neither specific for '{target_user_acct}' nor a default). Cannot proceed with Mastodon operations.")
+        return None
 
     @property
     def reddit(self) -> praw.Reddit:
@@ -710,6 +860,11 @@ class SocialOSINTLM:
                         logger.warning(f"Bluesky access token not available for media download for URL: {url}. This might be okay for public CDNs.")
                     else:
                         auth_headers["Authorization"] = f"Bearer {access_token}"
+                # Note: Mastodon media is generally public via CDN links, specific auth not typically added here.
+                # If a Mastodon instance required auth for media and `_get_mastodon_client` returned a client for that specific instance,
+                # we *could* try to use its `access_token` here, but it's complex as `_download_media` doesn't know which client to use.
+                # For now, relies on public accessibility or generic user-agent.
+
             except RuntimeError as client_init_err:
                 logger.warning(f"Cannot add auth headers for {platform} media download, client init failed: {client_init_err}")
 
@@ -1018,7 +1173,7 @@ class SocialOSINTLM:
                 for list_key, dt_key in sort_key_map[platform]:
                     if list_key in data and isinstance(data[list_key], list) and data[list_key]:
                         # Filter out items that might be missing the sort key (though unlikely for primary data)
-                        items_to_sort = [item for item in data[list_key] if dt_key in item]
+                        # items_to_sort = [item for item in data[list_key] if dt_key in item] # Not needed if get_sort_key handles missing
                         # Sort the original list in place
                         data[list_key].sort(key=lambda x: get_sort_key(x, dt_key), reverse=True)
                         logger.debug(f"Sorted '{list_key}' for {platform}/{username} by '{dt_key}'.")
@@ -1300,6 +1455,10 @@ class SocialOSINTLM:
                 logger.info(f"Fetching live profile data for Reddit u/{username}.")
                 try:
                     # These attributes will trigger API calls
+                    # Ensure redditor_praw_obj is not None before accessing attributes
+                    if redditor_praw_obj is None: # Should not happen if reddit_client.redditor() was successful
+                        raise RuntimeError("PRAW Redditor object is None, cannot fetch profile.")
+
                     live_redditor_id = redditor_praw_obj.id 
                     live_redditor_created_utc = redditor_praw_obj.created_utc
                     
@@ -1321,17 +1480,12 @@ class SocialOSINTLM:
                     raise UserNotFoundError(f"Reddit user u/{username} not found (live profile fetch).")
                 except prawcore.exceptions.Forbidden: 
                     # This can happen if user is suspended/shadowbanned, or if our access is blocked
-                    # If suspended, is_suspended should ideally be True if PRAW can fetch it.
-                    # If it's a hard Forbidden (403 on profile access), we might not get is_suspended.
-                    # We'll log it as AccessForbiddenError.
                     logger.warning(f"Access forbidden to Reddit user u/{username}'s profile (live fetch). User might be suspended, shadowbanned, or access blocked.")
-                    # Attempt to see if PRAW object still yields 'is_suspended' despite broader 403
-                    # It might be None or False if the initial profile load failed completely.
-                    is_suspended_attr = getattr(redditor_praw_obj, 'is_suspended', None)
-                    if is_suspended_attr is True: # If we know they are suspended
-                         redditor_info = {"name": username, "is_suspended": True, "id": None} # Minimal info
+                    is_suspended_attr = getattr(redditor_praw_obj, 'is_suspended', None) if redditor_praw_obj else None
+                    if is_suspended_attr is True: 
+                         redditor_info = {"name": username, "is_suspended": True, "id": None} 
                          logger.warning(f"Marking user u/{username} as suspended based on PRAW attribute after Forbidden error.")
-                    else: # Could not confirm suspension, just a general access issue
+                    else: 
                          raise AccessForbiddenError(f"Access forbidden to Reddit user u/{username}'s profile (live fetch).")
 
                 except (prawcore.exceptions.PrawcoreException, RuntimeError) as client_err: 
@@ -1344,10 +1498,13 @@ class SocialOSINTLM:
             newly_added_media_paths = set()    # For this fetch run only
             fetch_limit_val = INCREMENTAL_FETCH_LIMIT 
             count_subs = 0 
-            processed_submission_ids = {s["id"] for s in existing_submissions} 
+            processed_submission_ids = {s["id"] for s in existing_submissions if "id" in s} # Ensure 'id' exists
 
             logger.debug("Fetching new submissions...")
             try:
+                # Ensure redditor_praw_obj is not None before using it
+                if redditor_praw_obj is None:
+                     raise RuntimeError("PRAW Redditor object is None, cannot fetch submissions.")
                 params_subs: Dict[str, Union[int, str]] = {"limit": fetch_limit_val}
                 if not force_refresh and latest_submission_fullname:
                     params_subs["before"] = latest_submission_fullname 
@@ -1361,7 +1518,6 @@ class SocialOSINTLM:
                         continue
 
                     media_items_for_submission = []
-                    # ... (rest of your media handling logic for submissions - unchanged)
                     submission_url = getattr(submission, "url", None)
                     if submission_url:
                         is_direct_media_link = any(submission_url.lower().endswith(ext) for ext in SUPPORTED_IMAGE_EXTENSIONS + [".mp4", ".webm", ".mov"])
@@ -1379,7 +1535,7 @@ class SocialOSINTLM:
 
                     is_gallery = getattr(submission, "is_gallery", False)
                     media_metadata = getattr(submission, "media_metadata", None)
-                    if not media_items_for_submission and is_gallery and media_metadata: # if not already processed as direct link
+                    if not media_items_for_submission and is_gallery and media_metadata: 
                         for media_id_key, media_item_val in media_metadata.items(): 
                             source = media_item_val.get("s")
                             preview_data = media_item_val.get("p", []) 
@@ -1418,14 +1574,21 @@ class SocialOSINTLM:
                     return None
                 else: 
                     logger.error(f"Reddit request failed fetching submissions for u/{username}: {req_err}")
+            except RuntimeError as rt_err: # Catch if redditor_praw_obj was None
+                logger.error(f"Runtime error during Reddit submission fetch for u/{username}: {rt_err}")
+                # Potentially return None or re-raise depending on desired handling
+                return None
             logger.info(f"Fetched {len(new_submissions_data)} new submissions for u/{username} (scanned approx {count_subs}).")
 
             # --- Fetch Comments ---
             new_comments_data = []
             count_comments = 0
-            processed_comment_ids = {c["id"] for c in existing_comments}
+            processed_comment_ids = {c["id"] for c in existing_comments if "id" in c} # Ensure 'id' exists
             logger.debug("Fetching new comments...")
             try:
+                # Ensure redditor_praw_obj is not None
+                if redditor_praw_obj is None:
+                    raise RuntimeError("PRAW Redditor object is None, cannot fetch comments.")
                 params_comments: Dict[str, Union[int, str]] = {"limit": fetch_limit_val}
                 if not force_refresh and latest_comment_fullname:
                     params_comments["before"] = latest_comment_fullname
@@ -1452,6 +1615,9 @@ class SocialOSINTLM:
                     return None
                 else: 
                     logger.error(f"Reddit request failed fetching comments for u/{username}: {req_err}")
+            except RuntimeError as rt_err: # Catch if redditor_praw_obj was None
+                logger.error(f"Runtime error during Reddit comment fetch for u/{username}: {rt_err}")
+                return None
             logger.info(f"Fetched {len(new_comments_data)} new comments for u/{username} (scanned approx {count_comments}).")
 
 
@@ -1571,7 +1737,7 @@ class SocialOSINTLM:
             newly_added_media_analysis = []
             newly_added_media_paths = set()
             cursor = None
-            processed_uris = set(p["uri"] for p in existing_posts) # Keep track of URIs already in cache
+            processed_uris = set(p["uri"] for p in existing_posts if "uri" in p) # Ensure 'uri' exists # Keep track of URIs already in cache
             fetch_limit_per_page = min(INCREMENTAL_FETCH_LIMIT, 100) # API max is 100
             total_fetched_this_run = 0
             # Determine overall fetch limit for this run
@@ -1712,8 +1878,8 @@ class SocialOSINTLM:
             logger.info(f"Fetched {len(new_posts_data)} new posts for Bluesky user {username}.")
 
             # Combine, sort, limit (newest first)
-            existing_uris_set = {p["uri"] for p in existing_posts} # Rebuild to be sure
-            unique_new_posts = [p for p in new_posts_data if p["uri"] not in existing_uris_set]
+            existing_uris_set = {p["uri"] for p in existing_posts if "uri" in p} # Rebuild to be sure, ensure 'uri' exists
+            unique_new_posts = [p for p in new_posts_data if p.get("uri") not in existing_uris_set] # Use .get for safety
 
             combined_posts = unique_new_posts + existing_posts
             combined_posts.sort(key=lambda x: get_sort_key(x, "created_at"), reverse=True)
@@ -1761,7 +1927,8 @@ class SocialOSINTLM:
         # Username MUST be in format user@instance.domain for Mastodon.py account_lookup
         # and for consistent caching key.
         cache_key_username = username # Use the full user@instance for cache key
-        if "@" not in cache_key_username or "." not in cache_key_username.split("@")[1]:
+        # Use _get_instance_domain_from_acct for a more robust check of the instance part
+        if "@" not in cache_key_username or not self._get_instance_domain_from_acct(cache_key_username):
             logger.error(f"Invalid Mastodon username format for fetch: '{cache_key_username}'. Needs 'user@instance.domain'.")
             # This should ideally be caught earlier during input, but double check here.
             raise ValueError(f"Invalid Mastodon username format: '{cache_key_username}'. Must be 'user@instance.domain'.")
@@ -1785,6 +1952,16 @@ class SocialOSINTLM:
             return cached_data
 
         logger.info(f"Fetching Mastodon data for {cache_key_username} (Force Refresh: {force_refresh})")
+
+        # Get the appropriate Mastodon client
+        masto_client = self._get_mastodon_client(target_user_acct=username)
+        if not masto_client:
+            logger.error(f"No suitable Mastodon client found to fetch data for {username}. Check Mastodon configuration (e.g., mastodon_instances.json).")
+            # Returning None will be handled by the caller as a failed fetch.
+            return None
+
+        logger.info(f"Using Mastodon client for instance: {masto_client.api_base_url} to process user {username}")
+
         since_id = None # ID of the newest status in cache to fetch newer ones
         existing_posts = []
         existing_media_analysis = []
@@ -1795,8 +1972,8 @@ class SocialOSINTLM:
         if not force_refresh and cached_data: # Stale cache exists
             logger.info(f"Attempting incremental fetch for Mastodon {cache_key_username}")
             existing_posts = cached_data.get("posts", [])
-            if existing_posts: # Assumed sorted
-                # existing_posts.sort(key=lambda x: get_sort_key(x, "created_at"), reverse=True)
+            if existing_posts: # Assumed sorted by _save_cache
+                # existing_posts.sort(key=lambda x: get_sort_key(x, "created_at"), reverse=True) # Re-sort just in case
                 since_id = existing_posts[0].get("id") # Mastodon status ID
                 if since_id: logger.debug(f"Using since_id: {since_id}")
             user_info = cached_data.get("user_info")
@@ -1805,7 +1982,7 @@ class SocialOSINTLM:
 
 
         try:
-            masto_client = self.mastodon # Uses configured instance
+            # masto_client is now sourced from _get_mastodon_client()
             if not user_info or force_refresh:
                 try:
                     # account_lookup resolves user@otherinstance.domain from configured instance
@@ -1848,7 +2025,7 @@ class SocialOSINTLM:
             newly_added_media_paths = set()
             fetch_limit_val = INITIAL_FETCH_LIMIT if (force_refresh or not since_id) else INCREMENTAL_FETCH_LIMIT
             api_limit_val = min(fetch_limit_val, MASTODON_FETCH_LIMIT) # Renamed api_limit
-            processed_status_ids = {p["id"] for p in existing_posts}
+            processed_status_ids = {p["id"] for p in existing_posts if "id" in p} # Ensure 'id' exists
             new_statuses = []
 
             logger.debug(f"Fetching new statuses for user ID {user_id_val} ({cache_key_username}) (since_id: {since_id})")
@@ -1909,24 +2086,27 @@ class SocialOSINTLM:
 
                 media_items_for_post = []
                 for attachment in status.get("media_attachments", []):
-                    media_url = attachment.get("url") # Original URL # Renamed media_url
-                    preview_url = attachment.get("preview_url") # Preview/thumbnail # Renamed preview_url
-                    media_type = attachment.get("type", "unknown") # image, video, gifv, audio # Renamed media_type
-                    description = attachment.get("description") # Alt text # Renamed description
-                    remote_url = attachment.get("remote_url") # If media is remote # Renamed remote_url
+                    media_url_val = attachment.get("url") # Original URL # Renamed media_url
+                    preview_url_val = attachment.get("preview_url") # Preview/thumbnail # Renamed preview_url
+                    media_type_val = attachment.get("type", "unknown") # image, video, gifv, audio # Renamed media_type
+                    description_val = attachment.get("description") # Alt text # Renamed description
+                    remote_url_val = attachment.get("remote_url") # If media is remote # Renamed remote_url
 
-                    url_to_download = media_url or preview_url # Prefer original if available # Renamed url_to_download
+                    url_to_download = media_url_val or preview_url_val # Prefer original if available # Renamed url_to_download
                     if url_to_download:
+                        # Pass the specific masto_client if media downloads require auth from that instance
+                        # For now, _download_media doesn't have a client pass-through, relies on public URLs or generic auth.
+                        # This could be an enhancement if specific instance tokens are needed for media.
                         media_path = self._download_media(url=url_to_download, platform="mastodon", username=cache_key_username)
                         if media_path:
                             analysis = None
-                            if media_type == "image" and media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+                            if media_type_val == "image" and media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
                                 image_context = f"Mastodon user {cache_key_username}'s post ({status.get('url', status_id)})"
                                 analysis = self._analyze_image(media_path, image_context)
-                            media_items_for_post.append({"id": str(attachment.get("id")), "type": media_type, "analysis": analysis, "url": media_url, "preview_url": preview_url, "remote_url": remote_url, "description": description, "local_path": str(media_path)})
+                            media_items_for_post.append({"id": str(attachment.get("id")), "type": media_type_val, "analysis": analysis, "url": media_url_val, "preview_url": preview_url_val, "remote_url": remote_url_val, "description": description_val, "local_path": str(media_path)})
                             if analysis: newly_added_media_analysis.append(analysis)
                             newly_added_media_paths.add(str(media_path))
-                        else: logger.warning(f"Failed to download Mastodon media {media_type} from {url_to_download} for status {status_id}")
+                        else: logger.warning(f"Failed to download Mastodon media {media_type_val} from {url_to_download} for status {status_id}")
 
                 is_reblog = status.get("reblog") is not None
                 reblog_info = status.get("reblog") if is_reblog else None
@@ -1938,15 +2118,15 @@ class SocialOSINTLM:
                     reblog_original_url = reblog_info.get("url")
 
 
-                tags_list = [{"name": tag["name"], "url": tag["url"]} for tag in status.get("tags", [])] # Renamed tags
-                mentions_list = [{"acct": mention["acct"], "url": mention["url"]} for mention in status.get("mentions", [])] # Renamed mentions
-                emojis_list = [{"shortcode": emoji["shortcode"], "url": emoji["url"]} for emoji in status.get("emojis", [])] # Renamed emojis
+                tags_list_val = [{"name": tag["name"], "url": tag["url"]} for tag in status.get("tags", [])] # Renamed tags
+                mentions_list_val = [{"acct": mention["acct"], "url": mention["url"]} for mention in status.get("mentions", [])] # Renamed mentions
+                emojis_list_val = [{"shortcode": emoji["shortcode"], "url": emoji["url"]} for emoji in status.get("emojis", [])] # Renamed emojis
 
                 poll_data = None
                 if status.get("poll"):
-                    poll_item = status["poll"] # Renamed poll
-                    poll_options = [{"title": opt["title"], "votes_count": opt.get("votes_count")} for opt in poll_item.get("options", [])]
-                    poll_data = {"id": str(poll_item.get("id")), "expires_at": poll_item.get("expires_at"), "expired": poll_item.get("expired"), "multiple": poll_item.get("multiple"), "votes_count": poll_item.get("votes_count"), "voters_count": poll_item.get("voters_count"), "options": poll_options}
+                    poll_item_val = status["poll"] # Renamed poll
+                    poll_options = [{"title": opt["title"], "votes_count": opt.get("votes_count")} for opt in poll_item_val.get("options", [])]
+                    poll_data = {"id": str(poll_item_val.get("id")), "expires_at": poll_item_val.get("expires_at"), "expired": poll_item_val.get("expired"), "multiple": poll_item_val.get("multiple"), "votes_count": poll_item_val.get("votes_count"), "voters_count": poll_item_val.get("voters_count"), "options": poll_options}
 
 
                 post_data = {"id": status_id, "created_at": status["created_at"].isoformat(), # created_at is datetime
@@ -1958,7 +2138,7 @@ class SocialOSINTLM:
                              "sensitive": status.get("sensitive", False), "language": status.get("language"),
                              "reblogs_count": status.get("reblogs_count",0), "favourites_count": status.get("favourites_count",0), "replies_count": status.get("replies_count",0),
                              "is_reblog": is_reblog, "reblog_original_author": reblog_original_author_acct, "reblog_original_url": reblog_original_url,
-                             "tags": tags_list, "mentions": mentions_list, "emojis": emojis_list, "poll": poll_data,
+                             "tags": tags_list_val, "mentions": mentions_list_val, "emojis": emojis_list_val, "poll": poll_data,
                              "media": media_items_for_post}
                 new_posts_data.append(post_data)
                 processed_status_ids.add(status_id)
@@ -1977,18 +2157,18 @@ class SocialOSINTLM:
 
             # Stats
             total_posts = len(final_posts)
-            original_posts = [p for p in final_posts if not p.get("is_reblog")]
-            total_original_posts = len(original_posts)
+            original_posts_list = [p for p in final_posts if not p.get("is_reblog")] # Renamed original_posts
+            total_original_posts = len(original_posts_list)
             total_reblogs = total_posts - total_original_posts
             posts_with_media = len([p for p in final_posts if p.get("media")])
             reply_posts_count = len([p for p in final_posts if p.get("in_reply_to_id")])
-            avg_favs = sum(p["favourites_count"] for p in original_posts) / max(total_original_posts, 1)
-            avg_reblogs_val = sum(p["reblogs_count"] for p in original_posts) / max(total_original_posts, 1) # Renamed avg_reblogs
-            avg_replies = sum(p["replies_count"] for p in original_posts) / max(total_original_posts, 1)
+            avg_favs = sum(p["favourites_count"] for p in original_posts_list) / max(total_original_posts, 1)
+            avg_reblogs_calc = sum(p["reblogs_count"] for p in original_posts_list) / max(total_original_posts, 1) # Renamed avg_reblogs
+            avg_replies = sum(p["replies_count"] for p in original_posts_list) / max(total_original_posts, 1)
 
             stats = {"total_posts_cached": total_posts, "total_original_posts_cached": total_original_posts, "total_reblogs_cached": total_reblogs, "total_replies_cached": reply_posts_count,
                      "posts_with_media": posts_with_media, "total_media_items_processed": len(final_media_paths),
-                     "avg_favourites_on_originals": round(avg_favs,2), "avg_reblogs_on_originals": round(avg_reblogs_val,2), "avg_replies_on_originals": round(avg_replies,2)}
+                     "avg_favourites_on_originals": round(avg_favs,2), "avg_reblogs_on_originals": round(avg_reblogs_calc,2), "avg_replies_on_originals": round(avg_replies,2)}
 
 
             final_data = {"timestamp": datetime.now(timezone.utc).isoformat(), # Handled by _save_cache
@@ -2006,7 +2186,7 @@ class SocialOSINTLM:
         except (UserNotFoundError, AccessForbiddenError) as user_err:
             logger.error(f"Mastodon fetch failed for {username}: {user_err}")
             return None
-        except RuntimeError as e: # From self.mastodon setup
+        except RuntimeError as e: # From self.mastodon setup (though less likely now) or other issues
             logger.error(f"Runtime error during Mastodon fetch for {username}: {e}")
             return None
         except Exception as e: # pragma: no cover
@@ -2050,7 +2230,7 @@ class SocialOSINTLM:
                 # existing_items.sort(key=lambda x: get_sort_key(x, "created_at"), reverse=True)
                 try:
                     # Get the created_at_i of the newest item in cache
-                    latest_timestamp_i = max(item.get("created_at_i", 0) for item in existing_items)
+                    latest_timestamp_i = max(item.get("created_at_i", 0) for item in existing_items if item.get("created_at_i") is not None) # Added None check
                     logger.debug(f"Using latest timestamp_i: {latest_timestamp_i}")
                 except ValueError: # pragma: no cover (if items list is empty or no created_at_i)
                     logger.debug("No valid existing items found to determine latest timestamp_i.")
@@ -2165,9 +2345,9 @@ class SocialOSINTLM:
             final_items = combined_items[:MAX_CACHE_ITEMS]
 
             # Basic Stats
-            story_items = [s for s in final_items if s["type"] == "story" or s["type"] == "ask_hn_or_job"]
-            comment_items = [c for c in final_items if c["type"] == "comment"]
-            poll_items = [p for p in final_items if p["type"] == "poll"] # Excludes pollopts for now
+            story_items = [s for s in final_items if s.get("type") == "story" or s.get("type") == "ask_hn_or_job"] # Use .get
+            comment_items = [c for c in final_items if c.get("type") == "comment"] # Use .get
+            poll_items = [p for p in final_items if p.get("type") == "poll"] # Excludes pollopts for now, use .get
 
             total_items = len(final_items)
             total_stories = len(story_items)
@@ -2311,6 +2491,9 @@ class SocialOSINTLM:
                     except (UserNotFoundError, AccessForbiddenError) as afe:
                         failed_fetches.append((platform, display_name, f"Access Error ({type(afe).__name__})"))
                         self.console.print(f"[yellow]Skipping {platform}/{display_name}: {afe}[/yellow]", highlight=False)
+                    except ValueError as ve: # Catch specific ValueErrors like invalid Mastodon username format from fetch_mastodon
+                        failed_fetches.append((platform, display_name, f"Input Error ({ve})"))
+                        self.console.print(f"[yellow]Skipping {platform}/{display_name}: {ve}[/yellow]", highlight=False)
                     except RuntimeError as rte: # Client init errors, etc.
                         failed_fetches.append((platform, display_name, f"Runtime Error ({rte})"))
                         logger.error(f"Runtime error during fetch for {platform}/{display_name}: {rte}", exc_info=False) # No full stack trace for common runtime issues
@@ -2780,7 +2963,7 @@ class SocialOSINTLM:
         report_content_md = content # Default to full content
 
         try:
-            if report_lines[0].strip() == "# OSINT Analysis Report":
+            if report_lines and report_lines[0].strip() == "# OSINT Analysis Report": # Check if report_lines is not empty
                 header_lines = []
                 content_start_index = 1 # After the main title
                 for i, line in enumerate(report_lines[1:], 1): # Start from second line
@@ -2803,12 +2986,12 @@ class SocialOSINTLM:
                         elif key_clean == "mode": metadata["mode"] = val_clean # Capture mode from report too
                 # The actual LLM content starts after the "---"
                 report_content_md = "\n".join(report_lines[content_start_index:]).strip()
-        except IndexError: # pragma: no cover (if report is too short)
+        except IndexError: # pragma: no cover (if report is too short or malformed for this parsing)
             logger.warning("Could not parse metadata from report header, using defaults.")
             report_content_md = content # Use full content as report body
 
         try:
-            filename = None # Initialize filename variable
+            filename: Optional[Path] = None # Initialize filename variable
             if format_type == "json":
                 filename = output_dir / f"{filename_base}.json"
                 data_to_save = {
@@ -2830,13 +3013,17 @@ class SocialOSINTLM:
                 full_content = md_metadata + report_content_md
                 filename.write_text(full_content, encoding="utf-8")
 
-            self.console.print(f"[green]Analysis saved to: {filename}[/green]")
+            if filename: # Check if filename was set
+              self.console.print(f"[green]Analysis saved to: {filename}[/green]")
+            else: # Should not happen if format_type is one of the choices
+              self.console.print(f"[bold red]Failed to determine filename for saving output.[/bold red]")
+
         except Exception as e: # pragma: no cover
             self.console.print(f"[bold red]Failed to save output: {str(e)}[/bold red]")
             logger.error(f"Failed to save output file {filename_base}: {e}", exc_info=True)
 
     def get_available_platforms(self, check_creds=True) -> List[str]:
-        """Determines which platforms are available based on environment variables."""
+        """Determines which platforms are available based on environment variables and config files."""
         available = []
         # Twitter
         if not check_creds or all(os.getenv(k) for k in ["TWITTER_BEARER_TOKEN"]):
@@ -2847,24 +3034,48 @@ class SocialOSINTLM:
         # Bluesky
         if not check_creds or all(os.getenv(k) for k in ["BLUESKY_IDENTIFIER", "BLUESKY_APP_SECRET"]):
             available.append("bluesky")
-        # Mastodon (check token AND valid base URL)
-        if not check_creds or all(os.getenv(k) for k in ["MASTODON_ACCESS_TOKEN", "MASTODON_API_BASE_URL"]):
-            base_url = os.getenv("MASTODON_API_BASE_URL")
-            parsed_url = urlparse(base_url) if base_url else None
-            if parsed_url and parsed_url.scheme and parsed_url.netloc:
-                available.append("mastodon")
-            elif check_creds: # Log issue if creds present but URL is bad/missing
-                if not base_url: logger.warning("Mastodon credentials found, but MASTODON_API_BASE_URL is missing.")
-                else: logger.warning(f"Mastodon credentials found, but MASTODON_API_BASE_URL ('{base_url}') is invalid.")
+        
+        # Mastodon - check for config file existence and basic validity
+        # self.mastodon_config_file_path_str is set in __init__
+        path_relative_to_base_dir = self.base_dir / self.mastodon_config_file_path_str
+        path_as_provided = Path(self.mastodon_config_file_path_str)
+        
+        actual_config_path: Optional[Path] = None
+        if path_relative_to_base_dir.is_file():
+            actual_config_path = path_relative_to_base_dir
+        elif path_as_provided.is_file():
+            actual_config_path = path_as_provided
+
+        if not check_creds: # If not checking credentials, assume Mastodon is conceptually available
+             available.append("mastodon")
+        elif actual_config_path: # Config file exists, now check its content if creds check is on
+            try:
+                # Basic check: can we load it as JSON and is it a list with at least one valid-looking entry?
+                with open(actual_config_path, "r", encoding="utf-8") as f:
+                    conf_data = json.load(f)
+                if isinstance(conf_data, list) and any(
+                    isinstance(item, dict) and item.get("api_base_url") and item.get("access_token")
+                    for item in conf_data if isinstance(item, dict) # Ensure item is dict before .get
+                ):
+                    available.append("mastodon")
+                elif check_creds: # Log issue if creds check is on and file content is bad
+                    logger.warning(f"Mastodon config file '{actual_config_path}' found but appears malformed or empty of valid instances. Mastodon might be unavailable for operations.")
+            except (json.JSONDecodeError, OSError) as e:
+                if check_creds: # Log issue if creds check is on and file is unreadable
+                    logger.warning(f"Could not read or parse Mastodon config file '{actual_config_path}': {e}. Mastodon might be unavailable for operations.")
+        elif check_creds: # File not found and checking creds
+            logger.debug(f"Mastodon config file '{self.mastodon_config_file_path_str}' not found. Mastodon unavailable for credentialed check.")
+
 
         # HackerNews (no creds needed, always available conceptually)
-        if not check_creds or True: # Always add if not checking creds, or if checking (it's fine)
+        # This logic means it's always added if not check_creds, or always added if check_creds (as it has no creds to fail)
+        if not check_creds or True: 
             available.append("hackernews")
         return sorted(list(set(available))) # Unique and sorted
 
     def run(self): # pragma: no cover
         """Runs the interactive mode of the analyzer."""
-        self.console.print(Panel("[bold blue]SocialOSINTLM[/bold blue]\nCollects and analyzes user activity across multiple platforms using vision and LLMs.\nEnsure API keys and identifiers are set in your `.env` file.", title="Welcome", border_style="blue"))
+        self.console.print(Panel("[bold blue]SocialOSINTLM[/bold blue]\nCollects and analyzes user activity across multiple platforms using vision and LLMs.\nEnsure API keys and identifiers are set in your `.env` file or Mastodon JSON config.", title="Welcome", border_style="blue"))
         
         # Display offline mode status prominently
         if self.args.offline:
@@ -2885,13 +3096,19 @@ class SocialOSINTLM:
             if not current_available:
                 all_conceptual = self.get_available_platforms(check_creds=False)
                 # If only HackerNews is conceptually available and no others are configured
-                if "hackernews" in all_conceptual and len(all_conceptual) == 1:
-                    self.console.print("[yellow]Only HackerNews seems to be available (no other platform credentials found).[/yellow]")
+                # Also check if Mastodon is not even conceptually available (e.g. config file doesn't exist at all)
+                mastodon_conceptually_available = "mastodon" in all_conceptual
+                is_only_hackernews = "hackernews" in all_conceptual and len(all_conceptual) == 1 \
+                                   or ("hackernews" in all_conceptual and "mastodon" in all_conceptual and len(all_conceptual) == 2 and not mastodon_conceptually_available)
+
+
+                if is_only_hackernews :
+                    self.console.print("[yellow]Only HackerNews seems to be available (no other platform credentials or Mastodon config found).[/yellow]")
                     current_available = ["hackernews"] # Allow proceeding with just HN
-                else:
-                    self.console.print("[bold red]Error: No platforms seem to be configured correctly.[/bold red]")
-                    self.console.print("Please set credentials in a `.env` file and ensure URLs/Identifiers are valid.")
-                    self.console.print("Check `analyzer.log` for detailed errors during startup.")
+                else: # Could be other conceptual platforms but none configured
+                    self.console.print("[bold red]Error: No platforms seem to be configured correctly for use.[/bold red]")
+                    self.console.print("Please set credentials in a `.env` file (for Twitter, Reddit, Bluesky) and/or ensure a valid Mastodon JSON configuration file is present and readable.")
+                    self.console.print("Check `analyzer.log` for detailed errors during startup or platform availability checks.")
                     break # Exit main loop
 
             # Sort available platforms for consistent display (e.g., Twitter first)
@@ -2982,44 +3199,57 @@ class SocialOSINTLM:
                         self.console.print(f"[yellow]No usernames entered for {platform_name_sel.capitalize()}. Skipping.[/yellow]")
                         continue
                     
-                    usernames_list = [u.strip() for u in user_input.split(",") if u.strip()] # Split and strip # Renamed usernames
-                    if not usernames_list: # If all inputs were empty or just commas
+                    usernames_list_raw = [u.strip() for u in user_input.split(",") if u.strip()] # Split and strip # Renamed usernames
+                    if not usernames_list_raw: # If all inputs were empty or just commas
                         self.console.print(f"[yellow]No valid usernames provided for {platform_name_sel.capitalize()} after stripping. Skipping.[/yellow]")
                         continue
 
                     # Platform-specific validation/normalization
                     validated_users = []
                     if platform_name_sel == "mastodon":
-                        default_instance_url = os.getenv("MASTODON_API_BASE_URL", "")
-                        default_instance_domain = urlparse(default_instance_url).netloc if default_instance_url else None
-                        for u_val in usernames_list: # Renamed u
-                            if "@" in u_val and "." in u_val.split("@")[1]: # Basic check for user@instance.domain
+                        # Initialize Mastodon clients if not already, to get default instance info for prompt
+                        if not self._mastodon_clients_initialized:
+                            self._initialize_mastodon_clients()
+                        
+                        default_instance_domain_for_prompt = None
+                        if self._default_mastodon_lookup_client and self._default_mastodon_lookup_client.api_base_url:
+                            # Extract domain like 'mastodon.social' from 'https://mastodon.social'
+                            default_instance_domain_for_prompt = urlparse(self._default_mastodon_lookup_client.api_base_url).netloc
+                        
+                        for u_val in usernames_list_raw: # Renamed u
+                            if "@" in u_val and self._get_instance_domain_from_acct(u_val): # Basic check for user@instance.domain
                                 validated_users.append(u_val)
                             else: # Username lacks instance
-                                if default_instance_domain: # If we have a default from .env
-                                    assumed_user = f"{u_val}@{default_instance_domain}"
-                                    if Confirm.ask(f"[yellow]Username '{u_val}' lacks instance. Assume '{assumed_user}' (from .env)?", default=True):
+                                if default_instance_domain_for_prompt: # If we have a default from config
+                                    assumed_user = f"{u_val}@{default_instance_domain_for_prompt}"
+                                    confirm_text = f"[yellow]Username '{u_val}' for Mastodon lacks an instance. Assume '{assumed_user}' (derived from default instance in your config)? [/yellow]"
+                                    if Confirm.ask(Text.from_markup(confirm_text), default=True):
                                         validated_users.append(assumed_user)
-                                    else: self.console.print(f"[yellow]Skipping Mastodon username '{u_val}' due to missing instance.[/yellow]")
+                                    else: self.console.print(f"[yellow]Skipping Mastodon username '{u_val}' due to missing instance and no confirmation.[/yellow]")
                                 else: # No default instance, cannot assume
-                                    self.console.print(f"[bold red]Invalid Mastodon username format: '{u_val}'. Needs 'user@instance.domain'. Cannot assume default. Skipping.[/bold red]")
-                        usernames_list = validated_users # Update usernames with validated/confirmed ones
-                    elif platform_name_sel == "twitter": usernames_list = [u.lstrip("@") for u in usernames_list]; validated_users = usernames_list
-                    elif platform_name_sel == "reddit": usernames_list = [u.replace("u/", "").replace("/u/", "") for u in usernames_list]; validated_users = usernames_list
-                    else: validated_users = usernames_list # For Bluesky handle, HackerNews, etc.
+                                    self.console.print(f"[bold red]Invalid Mastodon username: '{u_val}'. Must be 'user@instance.domain'. No default instance configured to make an assumption. Skipping.[/bold red]")
+                        # usernames_list_raw = validated_users # This should be assigned to validated_users and then used
+                    elif platform_name_sel == "twitter": 
+                        validated_users = [u.lstrip("@") for u in usernames_list_raw]
+                    elif platform_name_sel == "reddit": 
+                        validated_users = [u.replace("u/", "").replace("/u/", "") for u in usernames_list_raw]
+                    else: # For Bluesky handle, HackerNews, etc.
+                        validated_users = usernames_list_raw
                     
                     if validated_users:
                         if platform_name_sel not in platforms_to_query: platforms_to_query[platform_name_sel] = []
                         # Add only unique usernames per platform
-                        current_users = set(platforms_to_query[platform_name_sel])
-                        added_count = 0
-                        for user_to_add in validated_users: # Renamed user_val
-                            if user_to_add not in current_users:
-                                platforms_to_query[platform_name_sel].append(user_to_add)
-                                current_users.add(user_to_add)
-                                added_count +=1
-                        if added_count < len(validated_users): logger.debug(f"Excluded {len(validated_users) - added_count} duplicate username(s) for {platform_name_sel}.")
-                    else: logger.warning(f"No valid usernames remained for {platform_name_sel} after validation/confirmation.")
+                        current_users_on_platform = set(platforms_to_query[platform_name_sel])
+                        added_this_round_count = 0
+                        for user_to_add_val in validated_users: # Renamed user_val
+                            if user_to_add_val not in current_users_on_platform:
+                                platforms_to_query[platform_name_sel].append(user_to_add_val)
+                                current_users_on_platform.add(user_to_add_val)
+                                added_this_round_count +=1
+                        if added_this_round_count < len(validated_users): 
+                            logger.debug(f"Excluded {len(validated_users) - added_this_round_count} duplicate username(s) for {platform_name_sel}.")
+                    else: 
+                        logger.warning(f"No valid usernames remained for {platform_name_sel} after validation/confirmation.")
 
 
                 if not platforms_to_query: # No valid users for any selected platform
@@ -3027,9 +3257,8 @@ class SocialOSINTLM:
                     continue
 
                 # Initialize clients for selected platforms (catches config issues early)
-                self.console.print(f"[cyan]Initializing API clients{' (Offline mode checks)' if self.args.offline else ''}...")
+                self.console.print(f"[cyan]Initializing API client systems{' (Offline mode checks)' if self.args.offline else ''}...")
                 
-                # Create a Progress instance specifically for client initialization
                 client_init_progress = Progress(
                     SpinnerColumn(),
                     "[progress.description]{task.description}",
@@ -3039,25 +3268,35 @@ class SocialOSINTLM:
                 )
                 with client_init_progress:
                     init_task_id = client_init_progress.add_task("Initializing...", total=len(platforms_to_query)) # Renamed init_task
-                    for platform_name_iter in list(platforms_to_query.keys()): # Renamed platform_name, iterate over copy of keys
+                    for platform_name_iter_init in list(platforms_to_query.keys()): # Renamed platform_name, iterate over copy of keys
                         if init_task_id is not None and init_task_id in client_init_progress.task_ids:
-                             client_init_progress.update(init_task_id, description=f"Initializing {platform_name_iter.capitalize()}...")
+                             client_init_progress.update(init_task_id, description=f"Initializing {platform_name_iter_init.capitalize()} system...")
                         try:
                             # Accessing the property will trigger initialization and validation
                             # HackerNews has no client property on `self` (uses httpx directly).
-                            if platform_name_iter != "hackernews": 
-                                _ = getattr(self, platform_name_iter) # e.g., self.twitter
-                            logger.info(f"{platform_name_iter.capitalize()} client initialized successfully.")
+                            if platform_name_iter_init == "mastodon":
+                                # Explicitly trigger Mastodon client initialization from config
+                                # This ensures _mastodon_clients and _default_mastodon_lookup_client are populated.
+                                if not self._mastodon_clients_initialized: # Check if already done
+                                    self._initialize_mastodon_clients()
+                                # After initialization, check if any clients were actually loaded for Mastodon
+                                if not self._mastodon_clients:
+                                    raise RuntimeError("Mastodon client initialization failed: No clients loaded from configuration. Check config file and logs.")
+                                logger.info(f"Mastodon client system (clients: {len(self._mastodon_clients)}) initialized/checked successfully.")
+                            elif platform_name_iter_init != "hackernews": 
+                                _ = getattr(self, platform_name_iter_init) # e.g., self.twitter
+                            # If no exception, log success for the platform system
+                            logger.info(f"{platform_name_iter_init.capitalize()} client system initialized successfully.")
                         except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError, OpenAIError) as client_err: # Added OpenAIError
-                            self.console.print(f"[bold red]Error initializing {platform_name_iter.capitalize()} client:[/bold red] {client_err}")
-                            self.console.print(f"[yellow]Cannot analyze {platform_name_iter.capitalize()}. Check credentials/config and logs.[/yellow]")
-                            del platforms_to_query[platform_name_iter] # Remove from this round
+                            self.console.print(f"[bold red]Error initializing {platform_name_iter_init.capitalize()} client system:[/bold red] {client_err}")
+                            self.console.print(f"[yellow]Cannot analyze {platform_name_iter_init.capitalize()}. Check credentials/config and logs.[/yellow]")
+                            del platforms_to_query[platform_name_iter_init] # Remove from this round
                         finally:
                             if init_task_id is not None and init_task_id in client_init_progress.task_ids:
                                 client_init_progress.advance(init_task_id)
                 
                 if not platforms_to_query: # If all selected platforms failed client init
-                    self.console.print("[bold red]No clients could be initialized successfully. Returning to menu.[/bold red]")
+                    self.console.print("[bold red]No client systems could be initialized successfully for selected platforms. Returning to menu.[/bold red]")
                     continue
 
                 # Proceed to analysis loop with successfully initialized platforms
@@ -3080,140 +3319,140 @@ class SocialOSINTLM:
         """Runs the analysis query loop after platforms and users are selected."""
         # Prepare display string for current targets
         platform_labels = []
-        platform_names_list = sorted(platforms.keys()) # For saving output
-        for pf, users_list in platforms.items(): # Renamed users
-            display_users_list = []
-            user_prefix = ""
-            if pf == "twitter": user_prefix = "@"
-            elif pf == "reddit": user_prefix = "u/"
+        platform_names_list_for_save = sorted(platforms.keys()) # For saving output # Renamed platform_names_list
+        for pf_display, users_list_display in platforms.items(): # Renamed users
+            display_users_list_items = []
+            user_prefix_display = ""
+            if pf_display == "twitter": user_prefix_display = "@"
+            elif pf_display == "reddit": user_prefix_display = "u/"
             # Mastodon/Bluesky/HN handles are usually complete
-            for u_item in users_list: display_users_list.append(f"{user_prefix}{u_item}" if user_prefix else u_item) # Renamed u
-            platform_labels.append(f"{pf.capitalize()}: {', '.join(display_users_list)}")
-        platform_info = " | ".join(platform_labels)
-        current_targets_str = f"Targets: {platform_info}"
+            for u_item_display in users_list_display: display_users_list_items.append(f"{user_prefix_display}{u_item_display}" if user_prefix_display else u_item_display) # Renamed u
+            platform_labels.append(f"{pf_display.capitalize()}: {', '.join(display_users_list_items)}")
+        platform_info_str = " | ".join(platform_labels) # Renamed platform_info
+        current_targets_str_display = f"Targets: {platform_info_str}" # Renamed current_targets_str
         
-        offline_msg = " (OFFLINE MODE - Cache Only)" if self.args.offline else ""
-        self.console.print(Panel(f"{current_targets_str}{offline_msg}\nEnter your analysis query below.\nCommands: `exit` (return to menu), `refresh` (force full data fetch{'' if not self.args.offline else ', N/A in offline'}), `help`", title="🔎 Analysis Session", border_style="cyan", expand=False))
-        last_query = "" # Store the last successful query
+        offline_msg_display = " (OFFLINE MODE - Cache Only)" if self.args.offline else "" # Renamed offline_msg
+        self.console.print(Panel(f"{current_targets_str_display}{offline_msg_display}\nEnter your analysis query below.\nCommands: `exit` (return to menu), `refresh` (force full data fetch{'' if not self.args.offline else ', N/A in offline'}), `help`", title="🔎 Analysis Session", border_style="cyan", expand=False))
+        last_query_val = "" # Store the last successful query # Renamed last_query
 
         while True:
             try:
-                query = Prompt.ask("\n[bold green]Analysis Query>[/bold green]", default=last_query).strip()
-                if not query: continue # User just pressed Enter without input
-                last_query = query # Store for re-use
-                cmd = query.lower()
+                query_input = Prompt.ask("\n[bold green]Analysis Query>[/bold green]", default=last_query_val).strip() # Renamed query
+                if not query_input: continue # User just pressed Enter without input
+                last_query_val = query_input # Store for re-use
+                cmd_input = query_input.lower() # Renamed cmd
 
-                if cmd == "exit":
+                if cmd_input == "exit":
                     self.console.print("[yellow]Exiting analysis session, returning to platform selection.[/yellow]")
                     break
-                if cmd == "help":
+                if cmd_input == "help":
                     self.console.print(Panel(f"**Available Commands:**\n- `exit`: Return to the platform selection menu.\n- `refresh`: Force a full data fetch for all current targets, ignoring cache{' (N/A in offline mode)' if self.args.offline else ''}.\n- `help`: Show this help message.\n\n**To analyze:**\nSimply type your analysis question (e.g., 'What are the main topics discussed?', 'Identify potential location clues from images and text.')\nPressing Enter with no input repeats the last query.", title="Help", border_style="blue", expand=False))
                     continue
-                if cmd == "refresh":
+                if cmd_input == "refresh":
                     if self.args.offline:
                         self.console.print("[yellow]'refresh' command is not applicable in offline mode as no new data is fetched from platforms.[/yellow]")
                         continue
 
                     # Confirm before forcing refresh as it uses more API calls
                     if Confirm.ask("Force refresh data for all current targets? This ignores cache and uses more API calls.", default=False):
-                        total_targets_refresh = sum(len(u_list_ref) for u_list_ref in platforms.values()) # Corrected to u_list # Renamed u_list
-                        failed_refreshes = []
+                        total_targets_to_refresh = sum(len(u_list_for_refresh) for u_list_for_refresh in platforms.values()) # Corrected to u_list # Renamed u_list # Renamed total_targets_refresh
+                        failed_refreshes_list = [] # Renamed failed_refreshes
                         
                         # Create a Progress instance specifically for refresh
-                        refresh_progress = Progress(
+                        refresh_progress_bar = Progress( # Renamed refresh_progress
                             SpinnerColumn(),
                             "[progress.description]{task.description}",
                             transient=True,
                             console=self.console,
                             refresh_per_second=10,
                         )
-                        with refresh_progress:
-                            refresh_task_id = refresh_progress.add_task("[yellow]Refreshing data...", total=total_targets_refresh) # Renamed refresh_task
-                            for platform_ref, usernames_ref in platforms.items(): # Renamed platform, usernames
-                                fetcher_ref = getattr(self, f"fetch_{platform_ref}", None) # Renamed fetcher
-                                if not fetcher_ref: continue # Should not happen if platform is in `platforms`
-                                for username_ref in usernames_ref: # Renamed username
-                                    display_name_ref = username_ref # Simple display for progress # Renamed display_name
-                                    if platform_ref == "twitter": display_name_ref = f"@{username_ref}"
-                                    elif platform_ref == "reddit": display_name_ref = f"u/{username_ref}"
+                        with refresh_progress_bar:
+                            refresh_task_id_val = refresh_progress_bar.add_task("[yellow]Refreshing data...", total=total_targets_to_refresh) # Renamed refresh_task # Renamed refresh_task_id
+                            for platform_for_refresh, usernames_for_refresh in platforms.items(): # Renamed platform, usernames # Renamed platform_ref, usernames_ref
+                                fetcher_for_refresh = getattr(self, f"fetch_{platform_for_refresh}", None) # Renamed fetcher # Renamed fetcher_ref
+                                if not fetcher_for_refresh: continue # Should not happen if platform is in `platforms`
+                                for username_item_refresh in usernames_for_refresh: # Renamed username # Renamed username_ref
+                                    display_name_for_refresh = username_item_refresh # Simple display for progress # Renamed display_name # Renamed display_name_ref
+                                    if platform_for_refresh == "twitter": display_name_for_refresh = f"@{username_item_refresh}"
+                                    elif platform_for_refresh == "reddit": display_name_for_refresh = f"u/{username_item_refresh}"
                                     
-                                    if refresh_task_id is not None and refresh_task_id in refresh_progress.task_ids:
-                                        refresh_progress.update(refresh_task_id, description=f"[yellow]Refreshing {platform_ref}/{display_name_ref}...")
+                                    if refresh_task_id_val is not None and refresh_task_id_val in refresh_progress_bar.task_ids:
+                                        refresh_progress_bar.update(refresh_task_id_val, description=f"[yellow]Refreshing {platform_for_refresh}/{display_name_for_refresh}...")
                                     try:
-                                        result = fetcher_ref(username=username_ref, force_refresh=True)
-                                        if result is None: # Fetcher indicated failure, already logged by fetcher
+                                        result_from_fetch = fetcher_for_refresh(username=username_item_refresh, force_refresh=True) # Renamed result
+                                        if result_from_fetch is None: # Fetcher indicated failure, already logged by fetcher
                                             # Add to local list if not already (e.g. from specific exceptions)
-                                            if not any(f[0] == platform_ref and f[1] == display_name_ref for f in failed_refreshes):
-                                                failed_refreshes.append((platform_ref, display_name_ref))
-                                    except Exception as e_ref: # Catch-all for unexpected issues during forced refresh # Renamed e
-                                        logger.error(f"Unexpected error during refresh for {platform_ref}/{display_name_ref}: {e_ref}", exc_info=True)
-                                        self.console.print(f"[red]Unexpected Refresh failed for {platform_ref}/{display_name_ref}: {e_ref}[/red]")
-                                        if not any(f[0] == platform_ref and f[1] == display_name_ref for f in failed_refreshes):
-                                             failed_refreshes.append((platform_ref, display_name_ref))
+                                            if not any(f[0] == platform_for_refresh and f[1] == display_name_for_refresh for f in failed_refreshes_list):
+                                                failed_refreshes_list.append((platform_for_refresh, display_name_for_refresh))
+                                    except Exception as e_refresh_loop: # Catch-all for unexpected issues during forced refresh # Renamed e # Renamed e_ref
+                                        logger.error(f"Unexpected error during refresh for {platform_for_refresh}/{display_name_for_refresh}: {e_refresh_loop}", exc_info=True)
+                                        self.console.print(f"[red]Unexpected Refresh failed for {platform_for_refresh}/{display_name_for_refresh}: {e_refresh_loop}[/red]")
+                                        if not any(f[0] == platform_for_refresh and f[1] == display_name_for_refresh for f in failed_refreshes_list):
+                                             failed_refreshes_list.append((platform_for_refresh, display_name_for_refresh))
                                     finally:
-                                        if refresh_task_id is not None and refresh_task_id in refresh_progress.task_ids:
-                                             refresh_progress.advance(refresh_task_id)
-                        if failed_refreshes: self.console.print(f"[yellow]Data refresh attempted, but issues encountered for {len(failed_refreshes)} target(s) (see logs/previous messages).[/yellow]")
+                                        if refresh_task_id_val is not None and refresh_task_id_val in refresh_progress_bar.task_ids:
+                                             refresh_progress_bar.advance(refresh_task_id_val)
+                        if failed_refreshes_list: self.console.print(f"[yellow]Data refresh attempted, but issues encountered for {len(failed_refreshes_list)} target(s) (see logs/previous messages).[/yellow]")
                         else: self.console.print("[green]Data refresh attempt completed for all targets.[/green]")
                     continue # Back to query prompt
 
                 # Actual analysis call
-                self.console.print(f"\n[cyan]Starting analysis for query:[/cyan] '{query}'", highlight=False)
-                analysis_result = self.analyze(platforms, query)
+                self.console.print(f"\n[cyan]Starting analysis for query:[/cyan] '{query_input}'", highlight=False)
+                analysis_result_text = self.analyze(platforms, query_input) # Renamed analysis_result
 
-                if analysis_result:
+                if analysis_result_text:
                     # Check if the result is an error/warning message string or a report
-                    result_lower_stripped = analysis_result.strip().lower()
-                    is_error = any(result_lower_stripped.startswith(prefix) for prefix in ["[red]", "error:", "analysis failed", "analysis aborted"])
-                    is_warning = result_lower_stripped.startswith("[yellow]") or result_lower_stripped.startswith("warning:")
-                    border_col = "red" if is_error else ("yellow" if is_warning else "green")
+                    result_lower_stripped_text = analysis_result_text.strip().lower() # Renamed result_lower_stripped
+                    is_error_result = any(result_lower_stripped_text.startswith(prefix) for prefix in ["[red]", "error:", "analysis failed", "analysis aborted"]) # Renamed is_error
+                    is_warning_result = result_lower_stripped_text.startswith("[yellow]") or result_lower_stripped_text.startswith("warning:") # Renamed is_warning
+                    border_color_result = "red" if is_error_result else ("yellow" if is_warning_result else "green") # Renamed border_col
 
-                    content_to_render: Union[Markdown, Text]
-                    if is_error or is_warning:
+                    content_to_render_final: Union[Markdown, Text] # Renamed content_to_render
+                    if is_error_result or is_warning_result:
                         # For error/warning messages that are already Rich-formatted strings
-                        content_to_render = Text.from_markup(analysis_result)
+                        content_to_render_final = Text.from_markup(analysis_result_text)
                     else:
                         # For actual LLM-generated Markdown reports
-                        content_to_render = Markdown(analysis_result)
+                        content_to_render_final = Markdown(analysis_result_text)
                     
                     # Display the report in a panel
-                    self.console.print(Panel(content_to_render, title="Analysis Report", border_style=border_col, expand=False, title_align="left"))
+                    self.console.print(Panel(content_to_render_final, title="Analysis Report", border_style=border_color_result, expand=False, title_align="left"))
 
-                    if not is_error: # Only offer to save non-error reports
-                        save_report = False
-                        save_format = "markdown" # Default
-                        no_auto_save_flag = getattr(self.args, "no_auto_save", False)
-                        specified_format = getattr(self.args, "format", "markdown")
+                    if not is_error_result: # Only offer to save non-error reports
+                        should_save_report = False # Renamed save_report
+                        output_save_format = "markdown" # Default # Renamed save_format
+                        no_auto_save_arg = getattr(self.args, "no_auto_save", False) # Renamed no_auto_save_flag
+                        specified_format_arg = getattr(self.args, "format", "markdown") # Renamed specified_format
 
-                        if no_auto_save_flag: # If --no-auto-save is set, always prompt
+                        if no_auto_save_arg: # If --no-auto-save is set, always prompt
                             if Confirm.ask("Save this analysis report?", default=True):
-                                save_report = True
-                                save_format = Prompt.ask("Save format?", choices=["markdown", "json"], default=specified_format)
+                                should_save_report = True
+                                output_save_format = Prompt.ask("Save format?", choices=["markdown", "json"], default=specified_format_arg)
                         else: # Auto-save is enabled (default behavior)
-                            save_format = specified_format # Use format from args, or its default
-                            self.console.print(f"[cyan]Auto-saving analysis report as {save_format}...[/cyan]")
-                            save_report = True
+                            output_save_format = specified_format_arg # Use format from args, or its default
+                            self.console.print(f"[cyan]Auto-saving analysis report as {output_save_format}...[/cyan]")
+                            should_save_report = True
                         
-                        if save_report:
-                            self._save_output(analysis_result, query, platform_names_list, save_format)
+                        if should_save_report:
+                            self._save_output(analysis_result_text, query_input, platform_names_list_for_save, output_save_format)
                 else:
                     self.console.print("[red]Analysis returned no result (None). Check logs.[/red]")
 
             except (KeyboardInterrupt, EOFError): # Ctrl+C/D during query input
                 self.console.print("\n[yellow]Analysis query cancelled.[/yellow]")
                 if Confirm.ask("\nExit this analysis session (return to menu)?", default=False): break
-                else: last_query = ""; continue # Clear last query and restart loop
+                else: last_query_val = ""; continue # Clear last query and restart loop
             except RateLimitExceededError: # Should be caught by analyze, but defensive
                  self.console.print("[yellow]A rate limit was hit during analysis. Please wait before trying again.[/yellow]")
-            except RuntimeError as e_run: # From API call failure or other programmatic issues # Renamed e
-                logger.error(f"Runtime error during analysis query processing: {e_run}", exc_info=True)
-                self.console.print(f"\n[bold red]An error occurred during analysis:[/bold red] {e_run}")
+            except RuntimeError as e_runtime_loop: # From API call failure or other programmatic issues # Renamed e # Renamed e_run
+                logger.error(f"Runtime error during analysis query processing: {e_runtime_loop}", exc_info=True)
+                self.console.print(f"\n[bold red]An error occurred during analysis:[/bold red] {e_runtime_loop}")
                 self.console.print("[yellow]Check logs for details. You can try again or exit.[/yellow]")
-            except Exception as e_exc: # Unexpected error during analysis loop # Renamed e
-                logger.error(f"Unexpected error during analysis loop: {e_exc}", exc_info=True)
-                self.console.print(f"\n[bold red]An unexpected error occurred:[/bold red] {e_exc}")
+            except Exception as e_exception_loop: # Unexpected error during analysis loop # Renamed e # Renamed e_exc
+                logger.error(f"Unexpected error during analysis loop: {e_exception_loop}", exc_info=True)
+                self.console.print(f"\n[bold red]An unexpected error occurred:[/bold red] {e_exception_loop}")
                 if not Confirm.ask("An error occurred. Continue session?", default=True): break
-
+    
     def process_stdin(self): # pragma: no cover
         """Processes a single analysis request received via stdin."""
         stderr_console = Console(stderr=True) # For messages not part of report
@@ -3227,131 +3466,155 @@ class SocialOSINTLM:
 
         try:
             try:
-                input_data = json.load(sys.stdin)
-            except json.JSONDecodeError as json_err:
-                raise ValueError(f"Invalid JSON received on stdin: {json_err}")
+                input_data_json = json.load(sys.stdin) # Renamed input_data
+            except json.JSONDecodeError as json_err_stdin: # Renamed json_err
+                raise ValueError(f"Invalid JSON received on stdin: {json_err_stdin}")
 
-            platforms_in = input_data.get("platforms")
-            query = input_data.get("query")
+            platforms_from_stdin = input_data_json.get("platforms") # Renamed platforms_in
+            query_from_stdin = input_data_json.get("query") # Renamed query
 
-            if not isinstance(platforms_in, dict) or not platforms_in:
+            if not isinstance(platforms_from_stdin, dict) or not platforms_from_stdin:
                 raise ValueError("Invalid or missing 'platforms' data in JSON input. Must be a non-empty dictionary.")
-            if not isinstance(query, str) or not query.strip():
+            if not isinstance(query_from_stdin, str) or not query_from_stdin.strip():
                 raise ValueError("Invalid or missing 'query' in JSON input.")
-            query = query.strip()
+            query_from_stdin = query_from_stdin.strip()
 
-            valid_platforms_to_analyze: Dict[str, List[str]] = {}
-            available_configured = self.get_available_platforms(check_creds=True) # Platforms with creds
-            available_conceptual = self.get_available_platforms(check_creds=False) # All platforms tool knows
+            valid_platforms_to_process: Dict[str, List[str]] = {} # Renamed valid_platforms_to_analyze
+            available_platforms_configured = self.get_available_platforms(check_creds=True) # Platforms with creds # Renamed available_configured
+            available_platforms_conceptual = self.get_available_platforms(check_creds=False) # All platforms tool knows # Renamed available_conceptual
 
-            for platform_key, usernames_val in platforms_in.items(): # Renamed platform, usernames
-                platform_key_lower = platform_key.lower() # Normalize platform name # Renamed platform
-                if platform_key_lower not in available_conceptual:
-                    logger.warning(f"Platform '{platform_key_lower}' specified in stdin is not supported by this tool. Skipping.")
+            for platform_key_stdin, usernames_val_stdin in platforms_from_stdin.items(): # Renamed platform, usernames # Renamed platform_key, usernames_val
+                platform_key_lower_stdin = platform_key_stdin.lower() # Normalize platform name # Renamed platform # Renamed platform_key_lower
+                if platform_key_lower_stdin not in available_platforms_conceptual:
+                    logger.warning(f"Platform '{platform_key_lower_stdin}' specified in stdin is not supported by this tool. Skipping.")
                     continue
                 
                 # Check if platform requires config and if it's configured
                 # In offline mode, we still need the "concept" of the platform to exist, but don't need live creds to be working
                 # as we only use cache. However, client instantiation might still fail if basic env vars are missing.
-                requires_config = platform_key_lower != "hackernews" # HN needs no special config
-                if requires_config and platform_key_lower not in available_configured and not self.args.offline:
+                platform_requires_config = platform_key_lower_stdin != "hackernews" # HN needs no special config # Renamed requires_config
+                if platform_requires_config and platform_key_lower_stdin not in available_platforms_configured and not self.args.offline:
                     # Only strictly enforce configured platforms if *not* in offline mode
-                    logger.warning(f"Platform '{platform_key_lower}' specified in stdin requires configuration, but credentials/setup seem missing or invalid. Skipping.")
+                    logger.warning(f"Platform '{platform_key_lower_stdin}' specified in stdin requires configuration, but credentials/setup seem missing or invalid. Skipping for online mode.")
                     continue
 
                 # Process usernames (string or list)
-                processed_users = []
-                if isinstance(usernames_val, str):
-                    if usernames_val.strip(): processed_users = [usernames_val.strip()]
-                elif isinstance(usernames_val, list):
-                    processed_users = [u.strip() for u in usernames_val if isinstance(u, str) and u.strip()]
+                processed_usernames_stdin = [] # Renamed processed_users
+                if isinstance(usernames_val_stdin, str):
+                    if usernames_val_stdin.strip(): processed_usernames_stdin = [usernames_val_stdin.strip()]
+                elif isinstance(usernames_val_stdin, list):
+                    processed_usernames_stdin = [u.strip() for u in usernames_val_stdin if isinstance(u, str) and u.strip()]
                 else:
-                    logger.warning(f"Invalid username format for platform '{platform_key_lower}' in stdin. Expected string or list of strings. Skipping platform.")
+                    logger.warning(f"Invalid username format for platform '{platform_key_lower_stdin}' in stdin. Expected string or list of strings. Skipping platform.")
                     continue
                 
-                if not processed_users:
-                    logger.warning(f"No valid usernames provided for platform '{platform_key_lower}' in stdin. Skipping platform.")
+                if not processed_usernames_stdin:
+                    logger.warning(f"No valid usernames provided for platform '{platform_key_lower_stdin}' in stdin. Skipping platform.")
                     continue
 
                 # Validate/normalize usernames per platform
-                validated_users_for_platform = []
-                if platform_key_lower == "mastodon":
-                    for u_mast in processed_users: # Renamed u
-                        if "@" in u_mast and "." in u_mast.split("@")[1]: validated_users_for_platform.append(u_mast)
-                        else: logger.warning(f"Invalid Mastodon username format in stdin for '{u_mast}'. Needs 'user@instance.domain'. Skipping user.")
-                elif platform_key_lower == "twitter": validated_users_for_platform = [u.lstrip("@") for u in processed_users]
-                elif platform_key_lower == "reddit": validated_users_for_platform = [u.replace("u/", "").replace("/u/", "") for u in processed_users]
-                else: validated_users_for_platform = processed_users # Bluesky, HackerNews
+                validated_usernames_for_platform_stdin = [] # Renamed validated_users_for_platform
+                if platform_key_lower_stdin == "mastodon":
+                    for u_mastodon_stdin in processed_usernames_stdin: # Renamed u # Renamed u_mast
+                        if "@" in u_mastodon_stdin and self._get_instance_domain_from_acct(u_mastodon_stdin): 
+                            validated_usernames_for_platform_stdin.append(u_mastodon_stdin)
+                        else: 
+                            logger.warning(f"Invalid Mastodon username format in stdin for '{u_mastodon_stdin}'. Needs 'user@instance.domain'. Skipping user.")
+                elif platform_key_lower_stdin == "twitter": 
+                    validated_usernames_for_platform_stdin = [u.lstrip("@") for u in processed_usernames_stdin]
+                elif platform_key_lower_stdin == "reddit": 
+                    validated_usernames_for_platform_stdin = [u.replace("u/", "").replace("/u/", "") for u in processed_usernames_stdin]
+                else: # Bluesky, HackerNews
+                    validated_usernames_for_platform_stdin = processed_usernames_stdin
 
-                if not validated_users_for_platform:
-                    logger.warning(f"No valid usernames remained for platform '{platform_key_lower}' after validation. Skipping platform.")
+                if not validated_usernames_for_platform_stdin:
+                    logger.warning(f"No valid usernames remained for platform '{platform_key_lower_stdin}' after validation. Skipping platform.")
                     continue
 
-                if validated_users_for_platform:
-                    valid_platforms_to_analyze[platform_key_lower] = sorted(list(set(validated_users_for_platform))) # Store unique, sorted
+                if validated_usernames_for_platform_stdin:
+                    valid_platforms_to_process[platform_key_lower_stdin] = sorted(list(set(validated_usernames_for_platform_stdin))) # Store unique, sorted
 
-            if not valid_platforms_to_analyze:
+            if not valid_platforms_to_process:
                 raise ValueError("No valid and configured platforms with valid usernames found in the processed input.")
             
             # Initialize clients for requested platforms
-            logger.info(f"Initializing API clients for stdin request{' (Offline mode checks)' if self.args.offline else ''}...")
-            platforms_failed_init = []
-            for platform_name_init in list(valid_platforms_to_analyze.keys()): # Renamed platform_name_iter
-                if platform_name_init == "hackernews": # No client to init for HN
-                    logger.info("HackerNews requires no specific client initialization.")
+            logger.info(f"Initializing API client systems for stdin request{' (Offline mode checks)' if self.args.offline else ''}...")
+            platforms_failed_init_list = [] # Renamed platforms_failed_init
+            for platform_name_for_init_stdin in list(valid_platforms_to_process.keys()): # Renamed platform_name_iter # Renamed platform_name_init
+                if platform_name_for_init_stdin == "hackernews": # No client to init for HN
+                    logger.info("HackerNews requires no specific client system initialization.")
                     continue
                 try:
-                    _ = getattr(self, platform_name_init) # Trigger client init
-                    logger.info(f"{platform_name_init.capitalize()} client initialized successfully for stdin.")
-                except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError, OpenAIError) as client_err: # Added OpenAIError
-                    logger.error(f"Error initializing {platform_name_init.capitalize()} client for stdin: {client_err}")
-                    del valid_platforms_to_analyze[platform_name_init] # Remove if client fails
-                    platforms_failed_init.append(platform_name_init)
+                    if platform_name_for_init_stdin == "mastodon":
+                        # Explicitly trigger Mastodon client initialization from config
+                        if not self._mastodon_clients_initialized: # Check if already done
+                            self._initialize_mastodon_clients()
+                        # After initialization, check if any clients were actually loaded
+                        if not self._mastodon_clients:
+                            raise RuntimeError("Mastodon client system initialization failed: No clients loaded from configuration. Check config file and logs.")
+                        logger.info(f"Mastodon client system (clients: {len(self._mastodon_clients)}) initialized/checked successfully for stdin.")
+                    else:
+                        _ = getattr(self, platform_name_for_init_stdin) # Trigger client init for other platforms
+                    logger.info(f"{platform_name_for_init_stdin.capitalize()} client system initialized successfully for stdin.")
+                except (RuntimeError, ValueError, MastodonError, tweepy.errors.TweepyException, prawcore.exceptions.PrawcoreException, atproto_exceptions.AtProtocolError, OpenAIError) as client_err_stdin: # Added OpenAIError # Renamed client_err
+                    logger.error(f"Error initializing {platform_name_for_init_stdin.capitalize()} client system for stdin: {client_err_stdin}")
+                    del valid_platforms_to_process[platform_name_for_init_stdin] # Remove if client fails
+                    platforms_failed_init_list.append(platform_name_for_init_stdin)
             
-            if not valid_platforms_to_analyze and not platforms_failed_init: pass # This means no platforms were requested that needed init (e.g., only HN)
-            elif not valid_platforms_to_analyze : # All platforms that needed init failed
-                raise RuntimeError("No clients could be initialized successfully for the requested platforms.")
-            if platforms_failed_init:
-                logger.warning(f"Analysis will proceed without platforms that failed initialization: {', '.join(platforms_failed_init)}")
+            if not valid_platforms_to_process and not platforms_failed_init_list: # This means no platforms were requested that needed init (e.g., only HN)
+                pass 
+            elif not valid_platforms_to_process : # All platforms that needed init failed
+                raise RuntimeError(f"No client systems could be initialized successfully for the requested platforms: {', '.join(platforms_failed_init_list)}.")
+            if platforms_failed_init_list:
+                logger.warning(f"Analysis via stdin will proceed without platforms that failed client system initialization: {', '.join(platforms_failed_init_list)}")
 
 
             # Perform analysis
-            logger.info(f"Starting stdin analysis for query: '{query}' on platforms: {list(valid_platforms_to_analyze.keys())}")
-            analysis_report = self.analyze(valid_platforms_to_analyze, query)
+            logger.info(f"Starting stdin analysis for query: '{query_from_stdin}' on platforms: {list(valid_platforms_to_process.keys())}")
+            analysis_report_content = self.analyze(valid_platforms_to_process, query_from_stdin) # Renamed analysis_report
 
-            if not analysis_report: # Should be caught by analyze(), but defensive
+            if not analysis_report_content: # Should be caught by analyze(), but defensive
                 raise RuntimeError("Analysis function returned no result (None). Check logs for errors during data collection or formatting.")
             
             # Check if the report itself is an error message from analyze()
-            result_lower_stripped = analysis_report.strip().lower()
-            is_error_report = any(result_lower_stripped.startswith(prefix) for prefix in ["[red]", "error:", "analysis failed", "analysis aborted"])
+            result_lower_stripped_stdin = analysis_report_content.strip().lower() # Renamed result_lower_stripped
+            is_error_report_stdin = any(result_lower_stripped_stdin.startswith(prefix) for prefix in ["[red]", "error:", "analysis failed", "analysis aborted"]) # Renamed is_error_report
 
-            if not is_error_report:
-                platform_names_list_save = sorted(valid_platforms_to_analyze.keys()) # Renamed platform_names_list
-                no_auto_save_flag = getattr(self.args, "no_auto_save", False)
-                output_format = getattr(self.args, "format", "markdown")
+            if not is_error_report_stdin:
+                platform_names_list_for_save_stdin = sorted(valid_platforms_to_process.keys()) # Renamed platform_names_list # Renamed platform_names_list_save
+                no_auto_save_arg_stdin = getattr(self.args, "no_auto_save", False) # Renamed no_auto_save_flag
+                output_format_arg_stdin = getattr(self.args, "format", "markdown") # Renamed output_format
 
-                if no_auto_save_flag: # Print to stdout if no-auto-save
-                    print(analysis_report) # Print the raw report (could be markdown with Rich tags)
+                if no_auto_save_arg_stdin: # Print to stdout if no-auto-save
+                    # The analysis_report_content might contain Rich markup.
+                    # To print it as intended (e.g., Markdown rendered or Text with colors),
+                    # we should ideally use the console or parse it.
+                    # For simple stdout, printing raw string is okay, but might show markup.
+                    # If it's a Markdown string from LLM, printing it raw is fine.
+                    print(analysis_report_content) 
                     logger.info("Analysis complete. Report printed to stdout (--no-auto-save).")
                     sys.exit(0) # Success
                 else: # Auto-save enabled
-                    self._save_output(analysis_report, query, platform_names_list_save, output_format)
-                    stderr_console.print(f"[green]Analysis complete. Output auto-saved ({output_format}).[/green]")
+                    self._save_output(analysis_report_content, query_from_stdin, platform_names_list_for_save_stdin, output_format_arg_stdin)
+                    stderr_console.print(f"[green]Analysis complete. Output auto-saved ({output_format_arg_stdin}).[/green]")
                     sys.exit(0) # Success
             else: # The report from analyze() was an error message
                 sys.stderr.write("Analysis completed with errors:\n")
-                sys.stderr.write(analysis_report + "\n") # Print the error report (e.g. "[red]Failed...[/red]")
-                logger.error(f"Analysis via stdin completed but generated an error report. Query: '{query}'")
+                # analysis_report_content here is likely a Rich-formatted string like "[red]Error...[/red]"
+                # For stderr, we might want to strip Rich tags if not using Rich Console for stderr.
+                # Or, if we are okay with Rich tags in stderr logs, just print.
+                # For now, print as is.
+                sys.stderr.write(analysis_report_content + "\n") 
+                logger.error(f"Analysis via stdin completed but generated an error report. Query: '{query_from_stdin}'")
                 sys.exit(2) # Indicate error completion
 
-        except (json.JSONDecodeError, ValueError, RuntimeError) as e_proc: # Catch specific processing errors # Renamed e
-            logger.error(f"Error processing stdin request: {e_proc}", exc_info=False) # No full stack for these expected errors
-            sys.stderr.write(f"Error: {e_proc}\n")
+        except (json.JSONDecodeError, ValueError, RuntimeError) as e_proc_stdin: # Catch specific processing errors # Renamed e # Renamed e_proc
+            logger.error(f"Error processing stdin request: {e_proc_stdin}", exc_info=False) # No full stack for these expected errors
+            sys.stderr.write(f"Error: {e_proc_stdin}\n")
             sys.exit(1) # Indicate input/processing error
-        except Exception as e_crit: # Unexpected critical errors during stdin processing # Renamed e
-            logger.critical(f"Unexpected critical error during stdin processing: {e_crit}", exc_info=True)
-            sys.stderr.write(f"Critical Error: An unexpected error occurred - {e_crit}\n")
+        except Exception as e_crit_stdin: # Unexpected critical errors during stdin processing # Renamed e # Renamed e_crit
+            logger.critical(f"Unexpected critical error during stdin processing: {e_crit_stdin}", exc_info=True)
+            sys.stderr.write(f"Critical Error: An unexpected error occurred - {e_crit_stdin}\n")
             sys.exit(1) # Indicate critical failure
 
 
@@ -3381,17 +3644,34 @@ Optional for OpenRouter (if LLM_API_BASE_URL points to OpenRouter):
   OPENROUTER_X_TITLE      : Your project name for OpenRouter's `X-Title` header. (Default: SocialOSINTLM)
                             (Example: My OSINT Project)
 
-Platform Credentials (at least one set required, or just use HackerNews):
+Platform Credentials (at least one set required, or use HackerNews / Mastodon config):
   TWITTER_BEARER_TOKEN    : Twitter API v2 Bearer Token.
   REDDIT_CLIENT_ID        : Reddit App Client ID.
   REDDIT_CLIENT_SECRET    : Reddit App Client Secret.
   REDDIT_USER_AGENT       : Reddit App User Agent string.
   BLUESKY_IDENTIFIER      : Bluesky handle or DID.
   BLUESKY_APP_SECRET      : Bluesky App Password.
-  MASTODON_ACCESS_TOKEN   : Mastodon App Access Token.
-  MASTODON_API_BASE_URL   : Mastodon instance base URL (e.g., https://mastodon.social).
+  
+Mastodon Configuration (replaces old MASTODON_* vars):
+  MASTODON_CONFIG_FILE    : Path to a JSON file for Mastodon instance configurations.
+                            (Default: "mastodon_instances.json" in the script's working directory or data/ folder)
+                            Example mastodon_instances.json content:
+                            [
+                              {
+                                "name": "Main Instance", 
+                                "api_base_url": "https://mastodon.social",
+                                "access_token": "YOUR_TOKEN_FOR_MASTODON_SOCIAL",
+                                "is_default_lookup_instance": true 
+                              },
+                              {
+                                "name": "Tech Hub",
+                                "api_base_url": "https://fosstodon.org",
+                                "access_token": "YOUR_TOKEN_FOR_FOSSTODON_ORG"
+                              }
+                            ]
 
 Place these in a `.env` file in the same directory or set them in your environment.
+The Mastodon JSON file should be placed according to the MASTODON_CONFIG_FILE path.
 """,
     )
     parser.add_argument("--stdin", action="store_true", help="Read analysis request from stdin as JSON.\nExpected JSON format example:\n{\n  \"platforms\": {\n    \"twitter\": [\"user1\", \"user2\"],\n    \"reddit\": [\"user3\"],\n    \"hackernews\": [\"user4\"],\n    \"bluesky\": [\"handle1.bsky.social\"],\n    \"mastodon\": [\"user@instance.social\", \"another@other.server\"]\n  },\n  \"query\": \"Analyze communication style and main topics.\"\n}")
@@ -3425,7 +3705,7 @@ Place these in a `.env` file in the same directory or set them in your environme
         # Use a simple console for this critical error as Rich might not be fully set up or part of issue
         error_console = Console(stderr=True, style="bold red")
         error_console.print(f"\nCRITICAL ERROR: {e_main_run}")
-        error_console.print("Ensure necessary API keys (LLM_API_KEY, LLM_API_BASE_URL) and platform credentials/URLs are correctly set in .env or environment.")
+        error_console.print("Ensure necessary API keys (LLM_API_KEY, LLM_API_BASE_URL) and platform credentials/URLs are correctly set in .env or environment, or Mastodon JSON config.")
         error_console.print("Check analyzer.log for more details.")
         sys.exit(1)
     except Exception as e_main_crit: # Catch any other unexpected critical errors during startup # Renamed e
