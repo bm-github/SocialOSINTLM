@@ -1,22 +1,22 @@
 # 🚀 SocialOSINTLM
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), and Mastodon (multi-instance),  Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon (multi-instance), and Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 ## 🌟 Key Features
 
-✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Bluesky, Hacker News (via Algolia API), and Mastodon.  .
+✅ **Multi-Platform Data Collection:** Aggregates data from Twitter/X, Reddit, Bluesky, Hacker News (via Algolia API), and Mastodon (multi-instance support, with federated user lookup if a default instance is configured).
 
 ✅ **AI-Powered Analysis:** Utilises configurable models via OpenAI-compatible APIs for sophisticated text and image analysis.
 
 ✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style.
 
-✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity).
+✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity). Images are pre-processed (e.g., resized to a max dimension like 1536px, first frame of GIFs).
 
-✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (e.g., Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images (max 1536x1536 recommended for many models) for analysis.
+✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (e.g., Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images for analysis.
 
 ✅ **Cross-Account Comparison:** Analyze profiles across multiple selected platforms simultaneously.
 
-✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter & LLM APIs, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`.
+✅ **Intelligent Rate Limit Handling:** Detects API rate limits (especially detailed for Twitter, Mastodon, & LLM APIs, showing reset times), provides informative feedback, and prevents excessive requests. Raises `RateLimitExceededError`.
 
 ✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`.
 
@@ -26,137 +26,159 @@
 
 ✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`).
 
-✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 50 tweets, 50 Reddit submissions/comments, 50 HN items, ~40 Mastodon/Bluesky posts per API call) to balance depth and API usage.
+✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 50 for Twitter/Reddit/HN initial/incremental, 40 for Mastodon API limit) to balance depth and API usage.
 
 ✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`.
 
 ✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file, and a JSON file for Mastodon instances.
 
+✅ **Data Purging:** Interactive option to purge cached text/metadata, media files, or output reports.
+
 ```mermaid
 flowchart TD
     %% Initialization
-    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients
-    Verify Environment}}:::setupClass
-
+    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients<br/>Verify Environment}}
+    
     %% Mode Selection
-    AA --> B{Interactive or
-    Stdin Mode?}:::decisionClass
-
+    AA --> B{Interactive or<br/>Stdin Mode?}
+    
     %% Interactive Mode Path
-    B -->|Interactive| B1([Prompt Auto-Save Setting]):::inputClass
-    B1 --> C[/Display Platform Menu/]:::menuClass
-    C --> D{Platform
-    Selection}:::decisionClass
-
+    B -->|Interactive| B1([Prompt Auto-Save Setting])
+    B1 --> C[/Display Platform Menu/]
+    C --> D{Platform<br/>Selection}
+    
     %% Platform-Specific Branches
-    D -->|Twitter| E1([Twitter]):::twitterClass
-    D -->|Reddit| E2([Reddit]):::redditClass
-    D -->|HackerNews| E3([HackerNews]):::hnClass
-    D -->|Bluesky| E4([Bluesky]):::bskyClass
-    D -->|Mastodon| E5([Mastodon]):::MastodonClass
-    D -->|Cross-Platform| E6([Multiple Platforms]):::multiClass
-
+    D -->|Twitter| E1([Twitter])
+    D -->|Reddit| E2([Reddit])
+    D -->|HackerNews| E3([HackerNews])
+    D -->|Bluesky| E4([Bluesky])
+    D -->|Mastodon| E5([Mastodon])
+    D -->|Cross-Platform| E6([Multiple Platforms])
+    D -->|Purge Data| PD([Purge Data])
+    PD --> C
+    
     %% Stdin Mode Path
-    B -->|Stdin| F([Parse JSON Input]):::inputClass
-    F --> GA([Get Auto-Save Setting]):::inputClass
-    GA --> G([Extract Platforms & Query]):::inputClass
-
+    B -->|Stdin| F([Parse JSON Input])
+    F --> GA([Get Auto-Save Setting])
+    GA --> G([Extract Platforms & Query])
+    
     %% Analysis Loop Entry Points
-    E1 & E2 & E3 & E4 & E5 & E6--> H([Enter Analysis Loop]):::loopClass
-    G --> J([Run Analysis]):::analysisClass
-
+    E1 --> H([Enter Analysis Loop])
+    E2 --> H
+    E3 --> H
+    E4 --> H
+    E5 --> H
+    E6 --> H
+    G --> J([Run Analysis])
+    
     %% Command Processing in Analysis Loop
-    H -->|Query Input| I{Command
-    Type}:::decisionClass
+    H -->|Query Input| I{Command<br/>Type}
     I -->|Analysis Query| J
-    I -->|exit| Z([End Session]):::endClass
-    I -->|refresh| Y([Force Refresh Cache]):::refreshClass
+    I -->|exit| Z([End Session])
+    I -->|refresh| Y([Force Refresh Cache])
     Y --> H
-
+    
     %% Data Fetching and Caching
-    J --> K{Cache
-    Available?}:::cacheClass
-    K -->|Yes| M([Load Cached Data]):::cacheClass
-    K -->|No| L([Fetch Platform Data]):::apiClass
-
-    %% API & Rate Limit Handling Subgraph
-    subgraph API_Handling [API & Rate Limit Handling]
-        direction TB
-        L --> L1{Rate
-        Limited?}:::errorClass
-        L1 -->|Yes| L2([Handle Rate Limit]):::errorClass
-        L2 --> L5([Abort or Retry]):::errorClass
-        L1 -->|No| L3([Extract Text & URLs]):::dataClass
-        L3 --> L4([Save to Cache]):::apiClass
-    end
-
+    J --> K{Cache<br/>Available?}
+    K -->|Yes| M([Load Cached Data])
+    K -->|No| L([Fetch Platform Data])
+    
+    %% API & Rate Limit Handling
+    L --> L1{Rate<br/>Limited?}
+    L1 -->|Yes| L2([Handle Rate Limit])
+    L2 --> L5([Abort or Retry])
+    L1 -->|No| L3([Extract Text & URLs])
+    L3 --> L4([Save to Cache])
+    
     L4 --> M
-
+    
     %% Parallel Processing Paths
-    M --> N([Process Text Data]):::textClass
-    M --> O([Process Media Data]):::mediaClass
-
-    %% Media Analysis Pipeline Subgraph
-    subgraph Media_Analysis [Media Analysis Pipeline]
-        direction TB
-        O --> P([Download Media Files]):::mediaClass
-        P --> PA{File Exists}:::decisionClass
-        PA -->|Yes| Q1([Load existing cached File]):::mediaClass
-        PA -->|No| Q([Image Analysis via LLM]):::llmClass
-
-    end
-    Q --> R([Collect Media Analysis]):::mediaClass
+    M --> N([Process Text Data])
+    M --> O([Process Media Data])
+    
+    %% Media Analysis Pipeline
+    O --> P([Download Media Files])
+    P --> PA{File Exists}
+    PA -->|Yes| Q1([Load existing cached File])
+    PA -->|No| Q([Image Analysis via LLM])
+    
+    Q --> R([Collect Media Analysis])
     Q1 --> R
-
+    
     %% Text Formatting and Combining Results
-    N --> S([Format Platform Text]):::textClass
-
-    R & S --> T([Combine All Data]):::dataClass
-
+    N --> S([Format Platform Text])
+    
+    R --> T([Combine All Data])
+    S --> T
+    
     %% Final Analysis and Output
-    T --> U([Call Analysis LLM with Query]):::llmClass
-    U --> V([Format Analysis Results]):::outputClass
-     %% Auto-Save Decision
-    V --> V1{Auto-Save 
-    Enabled?}:::decisionClass
-
+    T --> U([Call Analysis LLM with Query])
+    U --> V([Format Analysis Results])
+    
+    %% Auto-Save Decision
+    V --> V1{Auto-Save<br/>Enabled?}
+    
     %% Handle Saving
-    V1 -->|Yes| WA([Save Results Automatically]):::outputClass
+    V1 -->|Yes| WA([Save Results Automatically])
     WA --> H
-    V1 -->|No| WB{Prompt User to Save?}:::decisionClass
-    WB --> |Yes|WC([Save Results]):::outputClass
+    V1 -->|No| WB{Prompt User to Save?}
+    WB -->|Yes| WC([Save Results])
     WC --> H
-    WB --> |No| H
-
-    %% Result display for each save option
-    GA --> V1
-    %% Custom Styling
-    classDef defaultClass fill:#FFFFFF,stroke:#333,stroke-width:1px,color:#000
-    classDef menuClass fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px,color:#000
-    classDef decisionClass fill:#FFF9C4,stroke:#FBC02D,stroke-width:2px,color:#000
-    classDef twitterClass fill:#1DA1F2,stroke:#0D47A1,stroke-width:2px,color:#FFF
-    classDef redditClass fill:#FF5700,stroke:#8D2202,stroke-width:2px,color:#FFF
-    classDef hnClass fill:#FF6600,stroke:#7F3300,stroke-width:2px,color:#FFF
-    classDef bskyClass fill:#66BB6A,stroke:#1B5E20,stroke-width:2px,color:#FFF
-    classDef MastodonClass fill:#9575CD,stroke:#4527A0,stroke-width:2px,color:#FFF %% Changed color for Mastodon
-    classDef multiClass fill:#4DB6AC,stroke:#004D40,stroke-width:2px,color:#FFF
-    classDef inputClass fill:#E3F2FD,stroke:#1976D2,stroke-width:2px,color:#000
-    classDef loopClass fill:#CE93D8,stroke:#6A1B9A,stroke-width:2px,color:#000
-    classDef analysisClass fill:#BBDEFB,stroke:#1565C0,stroke-width:2px,color:#000
-    classDef endClass fill:#FFCDD2,stroke:#C62828,stroke-width:2px,color:#000
-    classDef refreshClass fill:#80CBC4,stroke:#004D40,stroke-width:2px,color:#000
-    classDef cacheClass fill:#B2EBF2,stroke:#006064,stroke-width:2px,color:#000
-    classDef apiClass fill:#C5E1A5,stroke:#33691E,stroke-width:2px,color:#000
-    classDef errorClass fill:#E57373,stroke:#B71C1C,stroke-width:2px,color:#000
-    classDef dataClass fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#000
-    classDef textClass fill:#90CAF9,stroke:#1565C0,stroke-width:2px,color:#000
-    classDef mediaClass fill:#F48FB1,stroke:#AD1457,stroke-width:2px,color:#000
-    classDef llmClass fill:#FFCC80,stroke:#EF6C00,stroke-width:2px,color:#000
-    classDef outputClass fill:#F0F4C3,stroke:#827717,stroke-width:2px,color:#000
-    classDef setupClass fill:#D1C4E9,stroke:#4527A0,stroke-width:2px,color:#000
-
-    %% Style all nodes with default class if not otherwise specified
-    class A,AA,B defaultClass
+    WB -->|No| H
+    
+    %% Colorful Styling
+    classDef startClass fill:#E8F5E8,stroke:#4CAF50,stroke-width:3px,color:#2E7D32
+    classDef setupClass fill:#E3F2FD,stroke:#2196F3,stroke-width:2px,color:#1565C0
+    classDef decisionClass fill:#FFF3E0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    classDef inputClass fill:#F3E5F5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    classDef menuClass fill:#E8EAF6,stroke:#3F51B5,stroke-width:2px,color:#283593
+    
+    classDef twitterClass fill:#1DA1F2,stroke:#0D47A1,stroke-width:3px,color:#FFF
+    classDef redditClass fill:#FF4500,stroke:#CC3600,stroke-width:3px,color:#FFF
+    classDef hnClass fill:#FF6600,stroke:#E55A00,stroke-width:3px,color:#FFF
+    classDef bskyClass fill:#00D4FF,stroke:#0099CC,stroke-width:3px,color:#FFF
+    classDef mastodonClass fill:#6364FF,stroke:#4F50CC,stroke-width:3px,color:#FFF
+    classDef multiClass fill:#4CAF50,stroke:#388E3C,stroke-width:3px,color:#FFF
+    classDef purgeClass fill:#F44336,stroke:#D32F2F,stroke-width:3px,color:#FFF
+    
+    classDef loopClass fill:#E1BEE7,stroke:#8E24AA,stroke-width:2px,color:#4A148C
+    classDef analysisClass fill:#BBDEFB,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    classDef cacheClass fill:#B2DFDB,stroke:#00695C,stroke-width:2px,color:#004D40
+    classDef apiClass fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20
+    classDef errorClass fill:#FFCDD2,stroke:#D32F2F,stroke-width:2px,color:#B71C1C
+    classDef dataClass fill:#DCEDC8,stroke:#689F38,stroke-width:2px,color:#33691E
+    classDef textClass fill:#E1F5FE,stroke:#0288D1,stroke-width:2px,color:#01579B
+    classDef mediaClass fill:#FCE4EC,stroke:#C2185B,stroke-width:2px,color:#880E4F
+    classDef llmClass fill:#FFF8E1,stroke:#FFA000,stroke-width:2px,color:#E65100
+    classDef outputClass fill:#F1F8E9,stroke:#558B2F,stroke-width:2px,color:#33691E
+    classDef endClass fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#C62828
+    classDef refreshClass fill:#E0F2F1,stroke:#00796B,stroke-width:2px,color:#004D40
+    
+    %% Apply classes to nodes
+    class A startClass
+    class AA setupClass
+    class B,D,I,K,L1,PA,V1,WB decisionClass
+    class B1,F,GA,G inputClass
+    class C menuClass
+    class E1 twitterClass
+    class E2 redditClass
+    class E3 hnClass
+    class E4 bskyClass
+    class E5 mastodonClass
+    class E6 multiClass
+    class PD purgeClass
+    class H loopClass
+    class J analysisClass
+    class M cacheClass
+    class L,L4 apiClass
+    class L2,L5 errorClass
+    class T dataClass
+    class N,S textClass
+    class O,P,Q1,R mediaClass
+    class Q,U llmClass
+    class V,WA,WC outputClass
+    class Z endClass
+    class Y refreshClass
 ```
 
 *Flowchart Description Note:* In **Offline Mode (`--offline`)**, the "Fetch Platform Data" step and the "Download Media File" step within the Media Analysis Pipeline are *bypassed* if the data/media is not already in the cache. Analysis proceeds only with available cached information.
@@ -212,12 +234,13 @@ flowchart TD
 
     # --- Mastodon Configuration File Path ---
     # Path to your Mastodon JSON config. Defaults to "mastodon_instances.json" if not set.
+    # The script checks in 'data/mastodon_instances.json' first, then 'mastodon_instances.json' in CWD.
     # MASTODON_CONFIG_FILE="config/my_mastodon_servers.json"
     ```
     *Note: HackerNews does not require API keys.*
 
     **b. Mastodon Instance Configuration (JSON file):**
-    If using Mastodon, create a JSON file (e.g., `mastodon_instances.json` in the root directory, or specify path in `.env` via `MASTODON_CONFIG_FILE`).
+    If using Mastodon, create a JSON file (e.g., `mastodon_instances.json` in the `data/` directory or the script's current working directory, or specify a custom path in `.env` via `MASTODON_CONFIG_FILE`).
 
     **Example `mastodon_instances.json`:**
     ```json
@@ -256,7 +279,7 @@ Add the `--offline` flag to run the session using only cached data:
 ```bash
 python socialosintlm.py --offline
 ```
-1.  You'll be prompted to select platform(s).
+1.  You'll be prompted to select platform(s). You can also choose "Purge Data" from this menu.
 2.  Enter the username(s) for each selected platform (comma-separated if multiple).
     *   **Twitter:** Usernames *without* the leading `@`.
     *   **Reddit:** Usernames *without* the leading `u/`.
@@ -300,7 +323,7 @@ echo '{
   "query": "Summarize cached activity."
 }' | python socialosintlm.py --stdin --offline
 ```
-When using `--stdin --offline`, only cached data will be used. If a platform/user has no cache entry, it will be skipped. The tool will exit with a non-zero status code if *no* data could be loaded for *any* requested target due to missing cache entries.
+When using `--stdin --offline`, only cached data will be used. If a platform/user has no cache entry, it will be skipped. The tool will exit with a non-zero status code if *no* data could be loaded for *any* requested target due to missing cache entries, or if the analysis results in an error.
 
 ### Command-line Arguments
 *   `--stdin`: Read analysis configuration from standard input as a JSON object.
@@ -313,10 +336,10 @@ When using `--stdin --offline`, only cached data will be used. If a platform/use
 
 ## ⚡ Cache System
 *   **Text/API Data:** Fetched platform data is cached for **24 hours** in `data/cache/` as JSON files (`{platform}_{username}.json`). This minimizes redundant API calls.
-*   **Media Files:** Downloaded images and media are stored in `data/media/` using hashed filenames (`{url_hash}.media` with actual extension). These are not automatically purged by the 24-hour cache expiry but are reused if the same URL is encountered.
+*   **Media Files:** Downloaded images and media are stored in `data/media/` using hashed filenames (e.g., `{url_hash}.jpg`). These are not automatically purged by the 24-hour cache expiry but are reused if the same URL is encountered.
 *   In **Offline Mode (`--offline`)**, new data is *not* fetched, and the cache files are *not* updated or extended. The tool relies purely on the existing cache contents. New media files are *not* downloaded.
 *   Use the `refresh` command in interactive mode (online mode only) to force a bypass of the cache for the current session.
-*   Use the "Purge Data" option in the main menu to clear cache, media, or output reports.
+*   Use the "Purge Data" option in the main interactive menu to selectively clear all cache, media files, or output reports.
 
 ## 🔍 Error Handling & Logging
 *   **Rate Limits:** Detects API rate limits. For Twitter, Mastodon, and some LLM providers, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally. **Note:** Rate limit handling is bypassed in offline mode as no API calls are made.
@@ -330,11 +353,11 @@ When using `--stdin --offline`, only cached data will be used. If a platform/use
 *   **Text Analysis:**
     *   Uses the model specified by `ANALYSIS_MODEL` via the configured `LLM_API_BASE_URL`.
     *   Receives **formatted summaries** of fetched data (user info, stats, recent post/comment text snippets, media presence indicators) per platform, *not* raw API dumps.
-    *   Guided by a detailed **system prompt** focusing on objective, evidence-based analysis across domains: Behavioral Patterns, Semantic Content, Interests/Network, Communication Style.
-    *   **Offline Mode Impact:** The LLM is informed via the system prompt that it is running in offline mode and analysis is based *only* on potentially stale cached data. It will not have access to real-time or newly generated data.
+    *   Guided by a detailed **system prompt** focusing on objective, evidence-based analysis across domains: Behavioral Patterns, Semantic Content, Interests/Network, Communication Style, and explicitly detailed Network Connections/Associated Entities.
+    *   **Offline Mode Impact:** The LLM is informed via the system prompt that it is running in offline mode and analysis is based *only* on potentially stale cached data. It will not have access to real-time or newly generated data. Resolution of associated entity handles/DIDs might be incomplete.
 *   **Image Analysis:**
     *   Uses the vision-capable model specified by `IMAGE_ANALYSIS_MODEL` via the configured `LLM_API_BASE_URL`.
-    *   Images larger than 1536x1536 are resized before analysis. Animated GIFs use their first frame. Images are converted to a common format (e.g., JPEG) if necessary.
+    *   Images larger than a configurable maximum dimension (e.g., 1536px, suitable for many vision models) are resized before analysis. Animated GIFs use their first frame. Images are converted to a common format (e.g., JPEG) if necessary.
     *   Guided by a specific **prompt** requesting objective identification of key OSINT-relevant elements (setting, objects, people details, text, activity, overall theme). Avoids speculation.
     *   **Offline Mode Impact:** Image analysis is **only performed if the image file was already downloaded and cached** in a previous online run. New media linked in cached posts will *not* be downloaded or analyzed visually when `--offline` is used. The LLM is aware that visual context may be missing for some data points.
 *   **Integration:** The final text analysis incorporates insights derived from both the formatted text data summaries and the individual image analysis reports *that were available from the cache*.
