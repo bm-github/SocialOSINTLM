@@ -199,7 +199,7 @@ flowchart TD
     ```bash
     pip install -r requirements.txt
     ```
-    *(Ensure `requirements.txt` includes: `httpx`, `tweepy`, `praw`, `Mastodon.py`, `beautifulsoup4`, `rich`, `Pillow`, `atproto`, `python-dotenv`, `openai`)*
+    *(Ensure `requirements.txt` includes: `httpx`, `tweepy`, `praw`, `Mastodon.py`, `beautifulsoup4`, `rich`, `Pillow`, `atproto`, `python-dotenv`, `openai`, `humanize`)*
 
 3.  **Set up Configuration:**
 
