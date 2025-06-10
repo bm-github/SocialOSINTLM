@@ -12,6 +12,7 @@ import prawcore
 import shutil
 import base64
 import humanize
+import unicodedata
 from mastodon import (
     Mastodon,
     MastodonError,
@@ -350,6 +351,24 @@ class SocialOSINTLM:
         """Ensures necessary directories exist."""
         for dir_name in ["cache", "media", "outputs"]:
             (self.base_dir / dir_name).mkdir(parents=True, exist_ok=True)
+
+    def _sanitize_username(self, username: str) -> str:
+        """
+        Sanitizes a username by normalizing it and stripping Unicode control characters.
+        This prevents issues with bidi characters, zero-width spaces, and other
+        problematic non-printing characters.
+        """
+        # NFKC normalization handles many compatibility characters and can simplify the string.
+        normalized_user = unicodedata.normalize('NFKC', username)
+        
+        # Remove characters from the 'C' (Control) category, which includes
+        # Cc (Control), Cf (Format), Cs (Surrogate), Co (Private Use), Cn (Unassigned).
+        sanitized_user = "".join(ch for ch in normalized_user if unicodedata.category(ch)[0] != 'C')
+
+        if sanitized_user != username:
+            logger.info(f"Sanitized username input. Original: '{username.encode('unicode_escape').decode()}', Sanitized: '{sanitized_user}'")
+        
+        return sanitized_user
 
     def _handle_purge(self):
         """Handles the interactive purging of cached data."""
@@ -3551,7 +3570,7 @@ class SocialOSINTLM:
                         self.console.print(f"[yellow]No usernames entered for {platform_name_sel.capitalize()}. Skipping.[/yellow]")
                         continue
                     
-                    usernames_list_raw = [u.strip() for u in user_input.split(",") if u.strip()] # Split and strip # Renamed usernames
+                    usernames_list_raw = [self._sanitize_username(u.strip()) for u in user_input.split(",") if u.strip()] # Split and strip # Renamed usernames
                     if not usernames_list_raw: # If all inputs were empty or just commas
                         self.console.print(f"[yellow]No valid usernames provided for {platform_name_sel.capitalize()} after stripping. Skipping.[/yellow]")
                         continue
@@ -3867,9 +3886,10 @@ class SocialOSINTLM:
                 # Process usernames (string or list)
                 processed_usernames_stdin = [] # Renamed processed_users
                 if isinstance(usernames_val_stdin, str):
-                    if usernames_val_stdin.strip(): processed_usernames_stdin = [usernames_val_stdin.strip()]
+                    if usernames_val_stdin.strip(): 
+                        processed_usernames_stdin = [self._sanitize_username(usernames_val_stdin.strip())]
                 elif isinstance(usernames_val_stdin, list):
-                    processed_usernames_stdin = [u.strip() for u in usernames_val_stdin if isinstance(u, str) and u.strip()]
+                    processed_usernames_stdin = [self._sanitize_username(u.strip()) for u in usernames_val_stdin if isinstance(u, str) and u.strip()]
                 else:
                     logger.warning(f"Invalid username format for platform '{platform_key_lower_stdin}' in stdin. Expected string or list of strings. Skipping platform.")
                     continue
