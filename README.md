@@ -1,3 +1,15 @@
+# 🛑 THIS PROJECT HAS MOVED 🛑
+
+**This repository is no longer maintained. The project has been moved to a new repository.**
+
+Please visit the new repository for the latest code, issues, and releases:
+
+### 👉 [https://github.com/bm-github/owasp-social-osintlm](https://github.com/bm-github/owasp-social-osintlm) 👈
+
+
+
+
+
 # 🚀 SocialOSINTLM
 
 **SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon (multi-instance), and Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
